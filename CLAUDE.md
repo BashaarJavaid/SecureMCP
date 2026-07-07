@@ -40,7 +40,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1, items 1–5 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier). Item 6 (Parameter Validator on `tools/call`) is next.
+See `ROADMAP.md`. Phase 1, items 1–6 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier; Parameter Validator). Item 7 (cache invalidation: schema TTL, ETags, policy hot-reload) is next.
 
 ---
 
