@@ -13,6 +13,7 @@ dependencies = [
     "alembic==1.14.0",
     "redis==5.2.1",
     "pydantic-settings==2.7.0",
+    "pyyaml==6.0.2",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
     "httpx==0.28.1",
     "ruff==0.8.4",
     "mypy==1.14.0",
+    "types-pyyaml==6.0.12.20260518",
 ]
 
 [build-system]

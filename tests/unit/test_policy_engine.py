@@ -1,0 +1,84 @@
+"""ARCHITECTURE.md §11 unit criterion: policy resolution logic (RBAC)."""
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from services.gateway import policy_engine
+from services.gateway.policy_engine import PolicyEngine, PolicyFile
+
+
+def make_engine(identities: list[dict]) -> PolicyEngine:
+    return PolicyEngine(PolicyFile.model_validate({"version": 3, "identities": identities}))
+
+
+READONLY = {
+    "id": "agent-readonly",
+    "api_key_hash": "sha256:0",
+    "allowed_servers": [{"server_id": "github", "allowed_tools": ["list_issues", "get_pr"]}],
+}
+
+
+def test_allowed_tool_on_matching_server() -> None:
+    assert make_engine([READONLY]).is_allowed("agent-readonly", "github", "list_issues")
+
+
+def test_unlisted_tool_is_denied() -> None:
+    assert not make_engine([READONLY]).is_allowed("agent-readonly", "github", "merge_pr")
+
+
+def test_other_server_is_denied() -> None:
+    assert not make_engine([READONLY]).is_allowed("agent-readonly", "filesystem", "list_issues")
+
+
+def test_unknown_identity_is_denied() -> None:
+    assert not make_engine([READONLY]).is_allowed("nobody", "github", "list_issues")
+
+
+def test_missing_identity_is_denied() -> None:
+    assert not make_engine([READONLY]).is_allowed(None, "github", "list_issues")
+
+
+def test_denied_tools_overrides_wildcard_allow() -> None:
+    engine = make_engine(
+        [
+            {
+                "id": "ops",
+                "api_key_hash": "sha256:1",
+                "allowed_servers": [
+                    {
+                        "server_id": "*",
+                        "allowed_tools": ["*"],
+                        "denied_tools": ["delete_repo"],
+                    }
+                ],
+            }
+        ]
+    )
+    assert engine.is_allowed("ops", "github", "merge_pr")
+    assert not engine.is_allowed("ops", "github", "delete_repo")
+
+
+def test_conditions_key_is_rejected_until_phase_3(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(
+        """
+version: 1
+identities:
+  - id: "ops"
+    api_key_hash: "sha256:1"
+    allowed_servers:
+      - server_id: "*"
+        allowed_tools: ["*"]
+        conditions:
+          - "risk.score < 60"
+"""
+    )
+    with pytest.raises(ValidationError):
+        policy_engine.load(policy)
+
+
+def test_missing_policy_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        policy_engine.load(tmp_path / "nope.yaml")
