@@ -39,10 +39,14 @@ class PolicyEngine:
     def __init__(self, policy: PolicyFile) -> None:
         self.policy = policy
         self._identities = {identity.id: identity for identity in policy.identities}
+        self._by_key_hash = {identity.api_key_hash: identity.id for identity in policy.identities}
 
     @property
     def version(self) -> int:
         return self.policy.version
+
+    def identity_for_key_hash(self, key_hash: str) -> str | None:
+        return self._by_key_hash.get(key_hash)
 
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:
         """RBAC resolution: unknown/missing identity denies; a grant matches by exact
