@@ -30,18 +30,20 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Commands
 
-- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379). Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
+- `python scripts/generate_signing_key.py` — one-time: mint the audit-log ECDSA keypair into gitignored `secrets/`; the gateway fails startup without it.
+- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379), audit verifier sidecar. Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
 - `docker compose run --rm gateway alembic upgrade head` — run migrations in-container; from the host use `DATABASE_URL=postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp .venv/bin/alembic upgrade head`.
 - Local dev setup: `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
 - `.venv/bin/pytest` — tests
 - `.venv/bin/ruff check .` — lint
 - `.venv/bin/mypy services/` — strict type-check
-- `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain
+- `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain (+ signatures when the public key is present)
+- `.venv/bin/python scripts/audit_verifier_daemon.py [--once]` — incremental checkpointed verification (the compose `verifier` sidecar runs this on a loop)
 - `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build` — the schema-pruning demo
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector) and 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1) are done; item 11 (ECDSA signing on the audit log + incremental verifier daemon) is next.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), and 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint) are done; item 12 (performance benchmark suite + published latency numbers) is next.
 
 ---
 

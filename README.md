@@ -132,6 +132,7 @@ securmcp/
 ## Running the demo (Phase 1: schema pruning)
 
 ```bash
+python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
 python scripts/run_demo.py           # mints keys, writes policies/demo-policy.yaml, waits
 # in another terminal:
 POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build

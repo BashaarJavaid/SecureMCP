@@ -4,7 +4,8 @@ Mints two API keys, writes policies/demo-policy.yaml (gitignored — keys never 
 the repo), then connects to the dockerized gateway as each identity and shows what
 each one sees, finishing with the audit-log receipts.
 
-Run:
+Run (mint the audit signing keypair once first — the gateway won't start without it):
+    python scripts/generate_signing_key.py
     python scripts/run_demo.py
 and when prompted, in another terminal:
     POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build

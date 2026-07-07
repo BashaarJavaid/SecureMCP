@@ -33,7 +33,8 @@ This rule file (`index.mdc`) is the only thing that loads automatically on every
 
 ## Commands
 
-- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379). Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
+- `python scripts/generate_signing_key.py` — one-time: mint the audit-log ECDSA keypair into gitignored `secrets/`; the gateway fails startup without it.
+- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379), audit verifier sidecar. Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
 - `docker compose run --rm gateway alembic upgrade head` — run migrations in-container; from the host use `DATABASE_URL=postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp .venv/bin/alembic upgrade head`.
 - Local dev setup: `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
 - `.venv/bin/pytest` — tests
@@ -44,7 +45,7 @@ This rule file (`index.mdc`) is the only thing that loads automatically on every
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector) and 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1) are done; item 11 (ECDSA signing on the audit log + incremental verifier daemon) is next.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), and 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint) are done; item 12 (performance benchmark suite + published latency numbers) is next.
 
 ---
 

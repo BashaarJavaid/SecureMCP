@@ -17,6 +17,7 @@ COPY sample_target ./sample_target
 COPY policies ./policies
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY scripts ./scripts
 
 USER gateway
 EXPOSE 8000

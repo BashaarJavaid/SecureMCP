@@ -12,7 +12,7 @@ from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth
+from services.gateway import auth, signing
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import async_session
@@ -48,11 +48,13 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5).
+    # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
+    # so must a missing/unreadable audit signing key (§4.8, item 11).
     store = PolicyStore(settings.policy_file)
     app.state.policy_store = store
+    signing_key = signing.load_private_key(settings.signing_key_file)
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    writer = AuditWriter(redis_client, async_session, store)
+    writer = AuditWriter(redis_client, async_session, store, signing_key)
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
     manager = SessionManager(

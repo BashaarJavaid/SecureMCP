@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     shutdown_grace_seconds: int = 5
     # Half-width of the Replay Guard's accepted timestamp window (±30s, §4.8).
     replay_window_seconds: int = 30
+    # Audit-log ECDSA keypair (§4.8): minted via scripts/generate_signing_key.py.
+    # A gateway with no usable private key must not start (§5, fail closed).
+    signing_key_file: str = "secrets/audit_signing_key.pem"
+    signing_public_key_file: str = "secrets/audit_signing_key.pub.pem"
 
 
 settings = Settings()
