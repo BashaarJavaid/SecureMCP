@@ -30,6 +30,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # UPSTREAM_COMMAND: set when sample_target lands (ROADMAP Phase 1, item 8),
+      # e.g. "python sample_target/overscoped_server.py"
     ports:
       - "8000:8000"
     depends_on:

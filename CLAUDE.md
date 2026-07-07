@@ -39,7 +39,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1, item 1 (repo scaffold, Compose skeleton, initial migration) is done; item 2 (Session Manager + JSON-RPC Interceptor) is next.
+See `ROADMAP.md`. Phase 1, items 1–2 are done (scaffold/migrations; Session Manager + JSON-RPC Interceptor passthrough over Streamable HTTP); item 3 (Policy Engine RBAC + Schema Pruner) is next.
 
 ---
 
