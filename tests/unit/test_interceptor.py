@@ -1,9 +1,11 @@
 import logging
+from typing import Any, cast
 
 import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
+from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 
@@ -21,8 +23,28 @@ POLICY = PolicyFile.model_validate(
 )
 
 
-def make_interceptor(identity: str | None = "agent-readonly") -> Interceptor:
-    return Interceptor(identity_id=identity, engine=PolicyEngine(POLICY))
+class FakeWriter:
+    def __init__(self) -> None:
+        self.events: list[EventType] = []
+
+    async def write(
+        self,
+        event_type: EventType,
+        identity_id: str,
+        tool_name: str | None = None,
+        payload_extra: dict[str, Any] | None = None,
+        risk_score: int | None = None,
+    ) -> int:
+        self.events.append(event_type)
+        return 42
+
+
+def make_interceptor(identity: str = "agent-readonly") -> tuple[Interceptor, FakeWriter]:
+    writer = FakeWriter()
+    interceptor = Interceptor(
+        identity_id=identity, engine=PolicyEngine(POLICY), writer=cast(Any, writer)
+    )
+    return interceptor, writer
 
 
 def request(method: str, params: dict | None = None, id: int = 1) -> SessionMessage:  # noqa: A002
@@ -31,20 +53,22 @@ def request(method: str, params: dict | None = None, id: int = 1) -> SessionMess
     )
 
 
-def test_unhandled_method_passes_through_unmodified_but_logged(
+async def test_unhandled_method_passes_through_unmodified_but_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     message = request("weird/unknown", {"x": 1})
+    interceptor, _ = make_interceptor()
     with caplog.at_level(logging.INFO, logger="services.gateway.jsonrpc_interceptor"):
-        outcome = make_interceptor().on_client_message(message)
+        outcome = await interceptor.on_client_message(message)
 
     assert isinstance(outcome, Forward)
     assert outcome.message is message  # passed through, not rebuilt
     assert "weird/unknown" in caplog.text
 
 
-def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
-    outcome = make_interceptor().on_client_message(
+async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
+    interceptor, writer = make_interceptor()
+    outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "delete_repo", "arguments": {}})
     )
 
@@ -54,18 +78,35 @@ def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
     assert error.error.data["event_type"] == "DENY_RBAC"
     assert error.error.data["decision"] == "deny"
     assert error.error.data["policy_version"] == 1
+    assert error.error.data["audit_id"] == "42"  # the audit row's seq
+    assert writer.events == [EventType.DENY_RBAC]
 
 
-def test_authorized_tools_call_is_forwarded() -> None:
-    outcome = make_interceptor().on_client_message(
+async def test_authorized_tools_call_is_audited_then_forwarded() -> None:
+    interceptor, writer = make_interceptor()
+    outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
     )
     assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]  # recorded before forwarding
 
 
-def test_tools_list_response_is_pruned_by_identity() -> None:
-    interceptor = make_interceptor()
-    interceptor.on_client_message(request("tools/list", id=7))
+async def test_allow_that_cannot_be_recorded_is_denied() -> None:
+    interceptor, writer = make_interceptor()
+
+    async def broken_write(*args: Any, **kwargs: Any) -> int:
+        raise ConnectionError("postgres down")
+
+    writer.write = broken_write  # type: ignore[method-assign]
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {}})
+    )
+    assert isinstance(outcome, Respond)  # no record, no action (§5)
+
+
+async def test_tools_list_response_is_pruned_and_audited() -> None:
+    interceptor, writer = make_interceptor()
+    await interceptor.on_client_message(request("tools/list", id=7))
     response = SessionMessage(
         JSONRPCMessage(
             JSONRPCResponse(
@@ -76,6 +117,7 @@ def test_tools_list_response_is_pruned_by_identity() -> None:
         )
     )
 
-    out = interceptor.on_upstream_message(response)
+    out = await interceptor.on_upstream_message(response)
 
     assert out.message.root.result["tools"] == [{"name": "echo"}]
+    assert writer.events == [EventType.TOOLS_LIST]

@@ -18,7 +18,9 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.message import SessionMessage
 
 from services.gateway import upstream_client
+from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
+from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine
 
@@ -42,25 +44,34 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self, redis_client: aioredis.Redis, policy: PolicyEngine) -> None:
+    def __init__(
+        self, redis_client: aioredis.Redis, policy: PolicyEngine, writer: AuditWriter
+    ) -> None:
         self._redis = redis_client
         self._policy = policy
+        self._writer = writer
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    async def create(self, identity_id: str | None) -> Session:
+    async def create(self, identity_id: str) -> Session:
         if not settings.upstream_command:
             raise RuntimeError("UPSTREAM_COMMAND is not configured")
         session_id = uuid.uuid4().hex
+        # No record, no session (§5): the SESSION_START row lands before anything spawns.
+        await self._writer.write(
+            EventType.SESSION_START, identity_id, payload_extra={"session_id": session_id}
+        )
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
         process = await upstream_client.spawn(settings.upstream_command)
         session = Session(
             id=session_id,
             transport=transport,
             process=process,
-            interceptor=Interceptor(identity_id=identity_id, engine=self._policy),
+            interceptor=Interceptor(
+                identity_id=identity_id, engine=self._policy, writer=self._writer
+            ),
         )
         self._sessions[session_id] = session
         await self._touch(session_id)
@@ -103,7 +114,7 @@ class SessionManager:
             if isinstance(item, Exception):
                 raise item
             await self._touch(session.id)
-            outcome = session.interceptor.on_client_message(item)
+            outcome = await session.interceptor.on_client_message(item)
             if isinstance(outcome, Respond):
                 # Terminal decision (e.g. DENY_RBAC): answer the client directly.
                 await write_stream.send(outcome.message)
@@ -116,7 +127,7 @@ class SessionManager:
         write_stream: MemoryObjectSendStream[SessionMessage],
     ) -> None:
         async for message in upstream_client.read_messages(session.process):
-            outcome = session.interceptor.on_upstream_message(SessionMessage(message))
+            outcome = await session.interceptor.on_upstream_message(SessionMessage(message))
             await write_stream.send(outcome)
 
     async def _touch(self, session_id: str) -> None:

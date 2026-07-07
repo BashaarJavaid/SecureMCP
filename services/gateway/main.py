@@ -1,6 +1,7 @@
 """FastAPI app entrypoint."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -11,8 +12,12 @@ from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
 from services.gateway import auth, policy_engine
+from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
+from services.gateway.db import async_session
 from services.gateway.session_manager import SessionManager
+
+logger = logging.getLogger(__name__)
 
 KEY_HEADER = "x-securmcp-key"
 
@@ -23,7 +28,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     policy = policy_engine.load(settings.policy_file)
     app.state.policy = policy
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    manager = SessionManager(redis_client, policy)
+    writer = AuditWriter(redis_client, async_session, policy.version)
+    manager = SessionManager(redis_client, policy, writer)
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
     try:
@@ -68,10 +74,15 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
             return
     elif scope["method"] == "POST":
         # A POST without a session header is a new session (the initialize request).
+        # Any failure here — including the SESSION_START audit write — means no
+        # session (§5: no record, no action).
         try:
             session = await manager.create(identity_id)
-        except RuntimeError as exc:
-            await Response(str(exc), status_code=503)(scope, receive, send)
+        except Exception:
+            logger.exception("session creation failed")
+            await Response("session could not be created", status_code=503)(
+                scope, receive, send
+            )
             return
     else:
         await Response("missing mcp-session-id header", status_code=400)(scope, receive, send)
