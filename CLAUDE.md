@@ -30,11 +30,16 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Commands
 
-*(To be filled in once the repo is scaffolded — e.g. `docker compose up`, `pytest --cov=services`, `ruff check`, `mypy --strict services/`.)*
+- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379). Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
+- `docker compose run --rm gateway alembic upgrade head` — run migrations in-container; from the host use `DATABASE_URL=postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp .venv/bin/alembic upgrade head`.
+- Local dev setup: `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
+- `.venv/bin/pytest` — tests
+- `.venv/bin/ruff check .` — lint
+- `.venv/bin/mypy services/` — strict type-check
 
 ## Current phase
 
-See `ROADMAP.md`. As of this file's creation, no code has been written yet — Phase 1, item 1 (repo scaffold) is next.
+See `ROADMAP.md`. Phase 1, item 1 (repo scaffold, Compose skeleton, initial migration) is done; item 2 (Session Manager + JSON-RPC Interceptor) is next.
 
 ---
 

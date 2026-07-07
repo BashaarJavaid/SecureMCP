@@ -9,7 +9,7 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for what each item actually means and
 ## Build Order — Four Phases
 
 **Phase 1 — Core gateway (get something real working end-to-end)**
-1. Repo scaffold, Docker Compose skeleton, Postgres schema + Alembic migration for `audit_log` and `policies`.
+1. ~~Repo scaffold, Docker Compose skeleton, Postgres schema + Alembic migration for `audit_log` and `policies`~~ — **done**: the "policies" table is `policy_versions` per `ARCHITECTURE.md` §4.8 (YAML files remain the policy content store); `audit_log.signature` is nullable until ECDSA signing lands in Phase 2, item 11.
 2. Session Manager + JSON-RPC Interceptor wired to a single hardcoded upstream server, full passthrough, no policy yet — includes the `lifespan`/SIGTERM subprocess-cleanup handler (with per-subprocess `ProcessLookupError`/`OSError` handling) and the Redis-TTL session idle timeout from day one, since both are cheap to add while there's only one subprocess type to manage and easy to forget once more moving pieces exist.
 3. Policy Engine (RBAC only for now) + Schema Pruner — identity-scoped `tools/list`.
 4. Auth layer (API key → identity, hash-and-lookup, no HMAC/JWT).
