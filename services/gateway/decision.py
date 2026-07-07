@@ -1,0 +1,52 @@
+"""Canonical Decision object and event-type enum (ARCHITECTURE.md §4.3). Types only —
+the pipeline that produces these lands across later ROADMAP items."""
+
+from enum import StrEnum
+
+from pydantic import BaseModel
+
+
+class EventType(StrEnum):
+    SESSION_START = "SESSION_START"
+    TOOLS_LIST = "TOOLS_LIST"
+    ALLOW = "ALLOW"
+    DENY_RBAC = "DENY_RBAC"
+    DENY_ABAC = "DENY_ABAC"
+    DENY_REPLAY = "DENY_REPLAY"
+    DENY_DRIFT = "DENY_DRIFT"
+    DENY_RISK = "DENY_RISK"
+    DENY_VALIDATION = "DENY_VALIDATION"
+    DENY_APPROVAL_MISMATCH = "DENY_APPROVAL_MISMATCH"
+    CHALLENGE = "CHALLENGE"
+    HUMAN_APPROVAL_REQUIRED = "HUMAN_APPROVAL_REQUIRED"
+    APPROVED = "APPROVED"
+    EXPIRED = "EXPIRED"
+    DRIFT_LOW = "DRIFT_LOW"
+    DRIFT_MEDIUM = "DRIFT_MEDIUM"
+    DRIFT_HIGH = "DRIFT_HIGH"
+    DRIFT_CRITICAL = "DRIFT_CRITICAL"
+    POLICY_ACTIVATED = "POLICY_ACTIVATED"
+    POLICY_ERROR = "POLICY_ERROR"
+
+
+class DecisionOutcome(StrEnum):
+    ALLOW = "allow"
+    DENY = "deny"
+    CHALLENGE = "challenge"
+    HUMAN_APPROVAL_REQUIRED = "human_approval_required"
+
+
+class RiskFactor(BaseModel):
+    factor: str
+    contribution: int
+
+
+class Decision(BaseModel):
+    decision: DecisionOutcome
+    event_type: EventType
+    reason: str
+    matched_rules: list[str]
+    risk_score: int | None = None
+    risk_factors: list[RiskFactor] | None = None
+    policy_version: int
+    audit_id: str
