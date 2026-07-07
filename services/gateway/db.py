@@ -52,6 +52,25 @@ class AuditLog(Base):
     )
 
 
+class ToolBaseline(Base):
+    """Accepted schema baseline per (server, tool) — the Drift Detector's trust anchor.
+    observed_* holds the latest drifted schema (what re-approval promotes) and dedups
+    drift events across polls."""
+
+    __tablename__ = "tool_baselines"
+
+    server_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    tool_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    approved_schema: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    approved_hash: Mapped[str] = mapped_column(CHAR(64))
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+    blocked: Mapped[bool] = mapped_column(default=False)
+    observed_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    observed_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+
+
 class PolicyVersion(Base):
     __tablename__ = "policy_versions"
 

@@ -29,6 +29,8 @@ class Identity(BaseModel):
 
     id: str
     api_key_hash: str
+    # Grants access to /admin endpoints (drift re-approval, and Phase 3's admin API).
+    admin: bool = False
     allowed_servers: list[ServerGrant] = []
 
 
@@ -52,6 +54,10 @@ class PolicyEngine:
 
     def identity_for_key_hash(self, key_hash: str) -> str | None:
         return self._by_key_hash.get(key_hash)
+
+    def is_admin(self, identity_id: str) -> bool:
+        identity = self._identities.get(identity_id)
+        return identity is not None and identity.admin
 
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:
         """RBAC resolution: unknown/missing identity denies; a grant matches by exact

@@ -22,6 +22,7 @@ from services.gateway import upstream_client
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import EventType
+from services.gateway.drift_detector import DriftDetector
 from services.gateway.jsonrpc_interceptor import Interceptor, Respond
 from services.gateway.policy_engine import PolicyStore
 from services.gateway.schema_cache import SchemaCache
@@ -52,11 +53,13 @@ class SessionManager:
         policy_store: PolicyStore,
         writer: AuditWriter,
         schema_cache: SchemaCache,
+        drift_detector: DriftDetector,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
         self._writer = writer
         self._schema_cache = schema_cache
+        self._drift_detector = drift_detector
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -85,6 +88,7 @@ class SessionManager:
                 store=self._policy_store,
                 writer=self._writer,
                 cache=self._schema_cache,
+                detector=self._drift_detector,
                 send_upstream=send_upstream,
             ),
         )

@@ -40,6 +40,7 @@ async def clean_audit() -> None:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
+            await conn.execute(text("TRUNCATE tool_baselines"))
     except Exception:
         pytest.skip("postgres not reachable — run: docker compose up -d postgres")
 

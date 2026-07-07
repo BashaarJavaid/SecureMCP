@@ -41,7 +41,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. **Phase 1 is complete** (items 1–8: scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier; Parameter Validator; cache invalidation with SIGHUP hot-reload; overscoped demo server + verified demo driver). Phase 2 starts with item 9 (Drift Detector with severity classification) — its hook point is the schema re-fetch in `jsonrpc_interceptor.py`.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: item 9 (Drift Detector: severity-classified baselines in `tool_baselines`, `DENY_DRIFT` at pipeline stage 5, admin re-approval endpoint gated by the policy YAML's `admin: true` flag) is done; item 10 (Replay Guard: nonce + timestamp + Redis dedup) is next.
 
 ---
 
