@@ -6,10 +6,14 @@ beyond the YAML `version` field is Phase 3 (item 19). A missing or invalid polic
 fails startup — fail closed (ARCHITECTURE.md §5).
 """
 
+import hashlib
+import logging
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class ServerGrant(BaseModel):
@@ -36,8 +40,9 @@ class PolicyFile(BaseModel):
 
 
 class PolicyEngine:
-    def __init__(self, policy: PolicyFile) -> None:
+    def __init__(self, policy: PolicyFile, content_hash: str = "") -> None:
         self.policy = policy
+        self.content_hash = content_hash
         self._identities = {identity.id: identity for identity in policy.identities}
         self._by_key_hash = {identity.api_key_hash: identity.id for identity in policy.identities}
 
@@ -67,5 +72,29 @@ class PolicyEngine:
 
 
 def load(path: str | Path) -> PolicyEngine:
-    data = yaml.safe_load(Path(path).read_text())
-    return PolicyEngine(PolicyFile.model_validate(data))
+    raw = Path(path).read_bytes()
+    data = yaml.safe_load(raw)
+    return PolicyEngine(
+        PolicyFile.model_validate(data), content_hash=hashlib.sha256(raw).hexdigest()
+    )
+
+
+class PolicyStore:
+    """Holds the live PolicyEngine; hot-swapped on SIGHUP (ARCHITECTURE.md §8). Readers
+    go through .engine on every call, so in-flight sessions re-resolve against a new
+    version on their next request rather than finishing out the old one."""
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self.engine = load(self._path)
+
+    def reload(self) -> bool:
+        """Swap in the file's current contents; keep last-known-good on any error —
+        a broken reload must not take the gateway down or weaken the active policy."""
+        try:
+            self.engine = load(self._path)
+        except Exception:
+            logger.exception("policy reload failed; keeping last-known-good policy")
+            return False
+        logger.info("policy reloaded: version %d", self.engine.version)
+        return True

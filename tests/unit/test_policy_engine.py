@@ -82,3 +82,25 @@ identities:
 def test_missing_policy_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         policy_engine.load(tmp_path / "nope.yaml")
+
+
+def test_policy_store_reload_swaps_engine(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("version: 1\nidentities: []\n")
+    store = policy_engine.PolicyStore(path)
+    assert store.engine.version == 1
+
+    path.write_text("version: 2\nidentities: []\n")
+    assert store.reload() is True
+    assert store.engine.version == 2
+    assert store.engine.content_hash  # recorded for the POLICY_ACTIVATED payload
+
+
+def test_policy_store_keeps_last_known_good_on_broken_reload(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("version: 1\nidentities: []\n")
+    store = policy_engine.PolicyStore(path)
+
+    path.write_text("version: [broken\n")
+    assert store.reload() is False
+    assert store.engine.version == 1  # old policy stays active

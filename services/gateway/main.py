@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import signal
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
@@ -11,10 +12,13 @@ from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth, policy_engine
+from services.gateway import auth
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import async_session
+from services.gateway.decision import EventType
+from services.gateway.policy_engine import PolicyStore
+from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -22,20 +26,45 @@ logger = logging.getLogger(__name__)
 KEY_HEADER = "x-securmcp-key"
 
 
+async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
+    old_version = store.engine.version
+    if not store.reload():
+        return  # last-known-good stays active; failure already logged
+    try:
+        await writer.write(
+            EventType.POLICY_ACTIVATED,
+            "operator",
+            payload_extra={
+                "old_version": old_version,
+                "new_version": store.engine.version,
+                "content_hash": store.engine.content_hash,
+            },
+        )
+    except Exception:
+        logger.exception("audit write failed for POLICY_ACTIVATED")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5).
-    policy = policy_engine.load(settings.policy_file)
-    app.state.policy = policy
+    store = PolicyStore(settings.policy_file)
+    app.state.policy_store = store
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    writer = AuditWriter(redis_client, async_session, policy.version)
-    manager = SessionManager(redis_client, policy, writer)
+    writer = AuditWriter(redis_client, async_session, store)
+    manager = SessionManager(redis_client, store, writer, SchemaCache(redis_client))
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
+    # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(
+        signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer))
+    )
     try:
         yield
     finally:
         # SIGTERM lands here via uvicorn's graceful shutdown (ARCHITECTURE.md §4.8).
+        with suppress(ValueError):
+            loop.remove_signal_handler(signal.SIGHUP)
         sweep.cancel()
         await manager.shutdown_all()
         await redis_client.aclose()
@@ -56,7 +85,9 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     session_id = headers.get(MCP_SESSION_ID_HEADER)
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
-    identity_id = auth.resolve_identity(headers.get(KEY_HEADER), scope["app"].state.policy)
+    identity_id = auth.resolve_identity(
+        headers.get(KEY_HEADER), scope["app"].state.policy_store.engine
+    )
     if identity_id is None:
         await Response("invalid or missing API key", status_code=401)(scope, receive, send)
         return

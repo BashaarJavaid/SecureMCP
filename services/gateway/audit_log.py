@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from services.gateway.config import settings
 from services.gateway.db import AuditLog
 from services.gateway.decision import EventType
+from services.gateway.policy_engine import PolicyStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,11 @@ class AuditWriter:
         self,
         redis_client: aioredis.Redis,
         sessionmaker: async_sessionmaker[AsyncSession],
-        policy_version: int,
+        policy_store: PolicyStore,
     ) -> None:
         self._redis = redis_client
         self._sessions = sessionmaker
-        self._policy_version = policy_version
+        self._policy_store = policy_store
         # Serializes chain writes so seq order matches chain order. Sufficient for the
         # single-instance Phase 1 deployment; multi-replica write ordering is the
         # documented §10 concern, deferred with the rest of the scaling story.
@@ -74,7 +75,7 @@ class AuditWriter:
                             "identity_id": identity_id,
                             "server_id": settings.upstream_server_id,
                             "tool_name": tool_name,
-                            "policy_version": self._policy_version,
+                            "policy_version": self._policy_store.engine.version,
                             **(payload_extra or {}),
                         }
                         curr_hash = compute_hash(prev_hash, payload)
@@ -125,7 +126,7 @@ class AuditWriter:
                 identity_id=identity_id,
                 server_id=settings.upstream_server_id,
                 tool_name=tool_name,
-                policy_version=self._policy_version,
+                policy_version=self._policy_store.engine.version,
                 event_type=event_type.value,
                 risk_score=risk_score,
                 payload=payload,
