@@ -1,5 +1,5 @@
-"""Identity-scoped tools/list (pruning) plus §4.1 point-of-action enforcement:
-a tool absent from the pruned menu is also denied when called directly."""
+"""Identity-scoped tools/list (pruning), §4.1 point-of-action enforcement, and the
+§4.8 auth layer: key → identity on every request, 401 on anything else."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,13 +10,16 @@ from mcp import ClientSession, McpError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
+from tests.integration.conftest import Gateway
+
 
 @asynccontextmanager
-async def connect(gateway: str, identity: str | None) -> AsyncIterator[ClientSession]:
-    headers = {"X-SecurMCP-Identity": identity} if identity else {}
+async def connect(url: str, api_key: str) -> AsyncIterator[ClientSession]:
     # follow_redirects matches the SDK's default client (Mount("/mcp") redirects to /mcp/).
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as http_client:
-        async with streamable_http_client(f"{gateway}/mcp", http_client=http_client) as (
+    async with httpx.AsyncClient(
+        headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
+    ) as http_client:
+        async with streamable_http_client(f"{url}/mcp", http_client=http_client) as (
             read,
             write,
             _,
@@ -26,8 +29,8 @@ async def connect(gateway: str, identity: str | None) -> AsyncIterator[ClientSes
                 yield session
 
 
-async def test_readonly_identity_sees_and_calls_only_allowed_tools(gateway: str) -> None:
-    async with connect(gateway, "agent-readonly") as session:
+async def test_readonly_identity_sees_and_calls_only_allowed_tools(gateway: Gateway) -> None:
+    async with connect(gateway.url, gateway.keys["agent-readonly"]) as session:
         tools = await session.list_tools()
         assert [tool.name for tool in tools.tools] == ["echo"]  # add pruned away
 
@@ -42,8 +45,8 @@ async def test_readonly_identity_sees_and_calls_only_allowed_tools(gateway: str)
         assert excinfo.value.error.data["decision"] == "deny"
 
 
-async def test_full_identity_sees_and_calls_everything(gateway: str) -> None:
-    async with connect(gateway, "agent-full") as session:
+async def test_full_identity_sees_and_calls_everything(gateway: Gateway) -> None:
+    async with connect(gateway.url, gateway.keys["agent-full"]) as session:
         tools = await session.list_tools()
         assert [tool.name for tool in tools.tools] == ["echo", "add"]
 
@@ -52,7 +55,39 @@ async def test_full_identity_sees_and_calls_everything(gateway: str) -> None:
         assert result.content[0].text == "5"
 
 
-async def test_missing_identity_gets_empty_tool_list(gateway: str) -> None:
-    async with connect(gateway, None) as session:
-        tools = await session.list_tools()
-        assert tools.tools == []
+async def test_missing_key_is_401(gateway: Gateway) -> None:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{gateway.url}/mcp/", json={})
+        assert response.status_code == 401
+
+
+async def test_wrong_key_is_401(gateway: Gateway) -> None:
+    async with httpx.AsyncClient(headers={"X-SecurMCP-Key": "not-a-real-key"}) as client:
+        response = await client.post(f"{gateway.url}/mcp/", json={})
+        assert response.status_code == 401
+
+
+async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway) -> None:
+    async with httpx.AsyncClient(
+        headers={"X-SecurMCP-Key": gateway.keys["agent-readonly"]}, follow_redirects=True
+    ) as http_client:
+        async with streamable_http_client(f"{gateway.url}/mcp", http_client=http_client) as (
+            read,
+            write,
+            get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                session_id = get_session_id()
+                assert session_id is not None
+
+                # agent-full's key is valid, but it isn't this session's identity.
+                async with httpx.AsyncClient() as other:
+                    response = await other.get(
+                        f"{gateway.url}/mcp/",
+                        headers={
+                            "X-SecurMCP-Key": gateway.keys["agent-full"],
+                            "mcp-session-id": session_id,
+                        },
+                    )
+                    assert response.status_code == 401

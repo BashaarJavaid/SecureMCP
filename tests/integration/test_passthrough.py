@@ -6,12 +6,14 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
+from tests.integration.conftest import Gateway
 
-async def test_full_sequence_passes_through(gateway: str) -> None:
+
+async def test_full_sequence_passes_through(gateway: Gateway) -> None:
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Identity": "agent-full"}, follow_redirects=True
+        headers={"X-SecurMCP-Key": gateway.keys["agent-full"]}, follow_redirects=True
     ) as http_client:
-        async with streamable_http_client(f"{gateway}/mcp", http_client=http_client) as (
+        async with streamable_http_client(f"{gateway.url}/mcp", http_client=http_client) as (
             read,
             write,
             _get_session_id,

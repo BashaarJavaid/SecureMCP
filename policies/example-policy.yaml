@@ -1,5 +1,6 @@
 # RBAC-only policy (Phase 1, item 3). ABAC `conditions` are rejected until Phase 3, item 17.
-# api_key_hash values are placeholders until the Auth Layer lands (Phase 1, item 4).
+# api_key_hash values below are non-functional placeholders — mint a real key/hash pair
+# with: python scripts/generate_api_key.py
 version: 1
 identities:
   - id: "agent-readonly"
