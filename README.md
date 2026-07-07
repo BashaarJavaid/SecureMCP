@@ -145,6 +145,27 @@ narrative below arrives feature-by-feature with later phases.
 
 ---
 
+## Performance
+
+Measured (not estimated — see `ARCHITECTURE.md` §9) on **2026-07-07** at commit **`1fc3617`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, with Postgres 16 and Redis 7 in local Docker. Every implemented pipeline stage was active: Replay Guard → auth → RBAC → drift check → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing. (The Risk Engine is a Phase 3 stub and is not in these numbers.)
+
+Method: N=1000 sequential `tools/call` round trips via the MCP client SDK, timed with `time.perf_counter()`; direct = stdio client straight at `sample_target/overscoped_server.py`, gateway = the same calls through one in-process gateway. Overhead = gateway − direct. Cold cache = the Redis schema key deleted before every timed call, forcing an upstream `tools/list` re-fetch + drift check per call (the direct path has no cache, so its column repeats the baseline). Concurrency levels run 20 calls per session against the single gateway process, each session owning its own upstream stdio subprocess. Latencies are mean / p50 / p95 / p99.
+
+| Scenario | Direct call | Through gateway | Overhead |
+|---|---|---|---|
+| Single call, cached schema | 1.48 / 1.39 / 1.75 / 3.93 ms | 11.45 / 10.86 / 16.42 / 20.49 ms | 9.97 / 9.47 / 14.67 / 16.56 ms |
+| Single call, cold schema cache | 1.48 / 1.39 / 1.75 / 3.93 ms | 13.93 / 13.36 / 19.23 / 24.77 ms | — |
+| 10 concurrent sessions (p95) | — | 67.99 ms | — |
+| 50 concurrent sessions (p95) | — | 493.49 ms | — |
+| 100 concurrent sessions (p95) | — | 2360.41 ms | — |
+| `tools/list` payload size (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
+
+Peak RSS after the 100-session run: 219 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by per-session stdio subprocesses — the known ceilings discussed in `ARCHITECTURE.md` §10.
+
+Reproduce: `docker compose up -d postgres redis && .venv/bin/python -m tests.benchmarks.run` (wipes the local dev audit chain, like the integration tests; per-run reports land in gitignored `tests/benchmarks/reports/`).
+
+---
+
 ## Demo Target (`sample_target/`)
 
 Two tiny MCP servers built specifically to make the gateway's value visible in a 30-second recording:

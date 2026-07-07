@@ -39,11 +39,12 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 - `.venv/bin/mypy services/` — strict type-check
 - `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain (+ signatures when the public key is present)
 - `.venv/bin/python scripts/audit_verifier_daemon.py [--once]` — incremental checkpointed verification (the compose `verifier` sidecar runs this on a loop)
+- `.venv/bin/python -m tests.benchmarks.run [N]` — performance benchmark suite (default N=1000 calls/scenario); needs postgres + redis up (`docker compose up -d postgres redis`) and wipes the dev audit chain like the integration tests do; reports land in gitignored `tests/benchmarks/reports/`
 - `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build` — the schema-pruning demo
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), and 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint) are done; item 12 (performance benchmark suite + published latency numbers) is next.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint), and 12 (benchmark suite: `python -m tests.benchmarks.run`, measured numbers in the README's Performance section) are done; item 13 (structured logging with structlog) is next.
 
 ---
 

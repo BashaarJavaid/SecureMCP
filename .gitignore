@@ -9,3 +9,4 @@ dist/
 *.egg-info/
 policies/demo-policy.yaml
 secrets/
+tests/benchmarks/reports/
