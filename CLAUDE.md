@@ -39,7 +39,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1, items 1–3 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner). Item 4 (Auth layer: API key → identity) is next — it replaces the temporary unverified `X-SecurMCP-Identity` header in `main.py`.
+See `ROADMAP.md`. Phase 1, items 1–4 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth on every request). Item 5 (audit log writer with hash chaining) is next.
 
 ---
 
