@@ -7,10 +7,11 @@ import pytest
 import yaml
 
 from services.gateway.config import settings
-from tests.integration.conftest import (  # noqa: F401  (clean_audit re-exported as a fixture)
+from tests.integration.conftest import (  # noqa: F401  (fixtures re-exported)
     Gateway,
     _key_hash,
     clean_audit,
+    gateway,
     running_gateway,
 )
 

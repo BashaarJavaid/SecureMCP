@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+import uuid
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -10,6 +12,7 @@ from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
+from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
 POLICY = PolicyFile.model_validate(
     {
@@ -63,6 +66,19 @@ class FakeDetector:
         return tool_name in self.blocked
 
 
+class FakeReplay:
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+
+    async def check(self, nonce: object, timestamp: object) -> str | None:
+        if not isinstance(nonce, str) or not isinstance(timestamp, int | float):
+            return "missing or invalid nonce or timestamp"
+        if nonce in self.seen:
+            return "nonce already seen within the timestamp window"
+        self.seen.add(nonce)
+        return None
+
+
 class FakeCache:
     def __init__(self) -> None:
         self.data: dict[str, list[dict[str, Any]]] = {}
@@ -98,12 +114,19 @@ def make_interceptor(
         writer=cast(Any, writer),
         cache=cast(Any, cache),
         detector=cast(Any, detector),
+        replay=cast(Any, FakeReplay()),
         send_upstream=_no_upstream,
     )
     return interceptor, writer, cache, detector
 
 
+def fresh_meta() -> dict[str, Any]:
+    return {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: time.time()}
+
+
 def request(method: str, params: dict | None = None, id: int = 1) -> SessionMessage:  # noqa: A002
+    if method == "tools/call" and params is not None and "_meta" not in params:
+        params = {**params, "_meta": fresh_meta()}
     return SessionMessage(
         JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=id, method=method, params=params))
     )
@@ -289,3 +312,73 @@ async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
     assert cache.data["default"] == [{"name": "echo"}, {"name": "delete_repo"}]
     assert writer.events == [EventType.TOOLS_LIST]
     assert detector.checked == [[{"name": "echo"}, {"name": "delete_repo"}]]  # full list
+
+
+async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
+    interceptor, writer, _, _ = make_interceptor()
+    meta = fresh_meta()
+    first = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": dict(meta)})
+    )
+    assert isinstance(first, Forward)
+
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": dict(meta)})
+    )
+    assert isinstance(outcome, Respond)
+    error = outcome.message.message.root
+    assert error.error.data["event_type"] == "DENY_REPLAY"
+    assert error.error.data["decision"] == "deny"
+    assert error.error.data["matched_rules"] == ["replay_guard"]
+    assert error.error.data["audit_id"] == "42"
+    assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
+
+
+async def test_missing_nonce_is_denied_before_rbac() -> None:
+    # Replay is pipeline stage 1 (§4.2): even an RBAC-denied tool reports DENY_REPLAY.
+    interceptor, writer, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "delete_repo", "arguments": {}, "_meta": {}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+    assert writer.events == [EventType.DENY_REPLAY]
+
+
+async def test_replay_check_failure_denies() -> None:
+    interceptor, _, _, _ = make_interceptor()
+
+    async def broken(nonce: object, timestamp: object) -> str | None:
+        raise ConnectionError("redis down")
+
+    interceptor.replay.check = broken  # type: ignore[method-assign]
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+
+
+async def test_forwarded_call_has_replay_meta_stripped() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Forward)
+    assert "_meta" not in outcome.message.message.root.params
+
+
+async def test_other_meta_content_survives_the_strip() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "hi"},
+                "_meta": {**fresh_meta(), "progressToken": "tok-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Forward)
+    assert outcome.message.message.root.params["_meta"] == {"progressToken": "tok-1"}

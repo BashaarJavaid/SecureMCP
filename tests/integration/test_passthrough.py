@@ -2,11 +2,10 @@
 sequence via the actual MCP client SDK, proxied through the gateway."""
 
 import httpx
-from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
-from tests.integration.conftest import Gateway
+from tests.integration.conftest import Gateway, ReplayCompliantSession
 
 
 async def test_full_sequence_passes_through(gateway: Gateway) -> None:
@@ -18,7 +17,7 @@ async def test_full_sequence_passes_through(gateway: Gateway) -> None:
             write,
             _get_session_id,
         ):
-            async with ClientSession(read, write) as session:
+            async with ReplayCompliantSession(read, write) as session:
                 init = await session.initialize()
                 assert init.serverInfo.name == "echo-upstream"  # upstream's identity, untouched
 

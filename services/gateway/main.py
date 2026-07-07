@@ -19,6 +19,7 @@ from services.gateway.db import async_session
 from services.gateway.decision import Decision, DecisionOutcome, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyStore
+from services.gateway.replay_guard import ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
@@ -55,7 +56,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
     manager = SessionManager(
-        redis_client, store, writer, SchemaCache(redis_client), detector
+        redis_client,
+        store,
+        writer,
+        SchemaCache(redis_client),
+        detector,
+        ReplayGuard(redis_client, settings.replay_window_seconds),
     )
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())

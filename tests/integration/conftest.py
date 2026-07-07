@@ -3,23 +3,54 @@ import hashlib
 import secrets
 import socket
 import sys
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
 import uvicorn
 import yaml
+from mcp import ClientSession
+from mcp.shared.session import ProgressFnT
+from mcp.types import CallToolResult
 from sqlalchemy import text
 
 from services.gateway.audit_log import POINTER_KEY
 from services.gateway.config import settings
 from services.gateway.db import Base, engine
 from services.gateway.main import app
+from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
 ECHO_SERVER = Path(__file__).parent / "fixtures" / "echo_server.py"
+
+
+class ReplayCompliantSession(ClientSession):
+    """ClientSession whose call_tool carries the Replay Guard's nonce/timestamp pair
+    (fresh per call) unless the test supplies its own via `meta=`."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        read_timeout_seconds: timedelta | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
+        meta = {
+            NONCE_META_KEY: str(uuid.uuid4()),
+            TIMESTAMP_META_KEY: time.time(),
+            **(meta or {}),
+        }
+        return await super().call_tool(
+            name, arguments, read_timeout_seconds, progress_callback, meta=meta
+        )
 
 
 @pytest.fixture

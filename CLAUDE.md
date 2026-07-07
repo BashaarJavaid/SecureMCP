@@ -41,7 +41,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: item 9 (Drift Detector: severity-classified baselines in `tool_baselines`, `DENY_DRIFT` at pipeline stage 5, admin re-approval endpoint gated by the policy YAML's `admin: true` flag) is done; item 10 (Replay Guard: nonce + timestamp + Redis dedup) is next.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector) and 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1) are done; item 11 (ECDSA signing on the audit log + incremental verifier daemon) is next.
 
 ---
 

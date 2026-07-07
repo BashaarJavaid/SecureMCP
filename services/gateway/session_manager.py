@@ -25,6 +25,7 @@ from services.gateway.decision import EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.jsonrpc_interceptor import Interceptor, Respond
 from services.gateway.policy_engine import PolicyStore
+from services.gateway.replay_guard import ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 
 logger = logging.getLogger(__name__)
@@ -54,12 +55,14 @@ class SessionManager:
         writer: AuditWriter,
         schema_cache: SchemaCache,
         drift_detector: DriftDetector,
+        replay_guard: ReplayGuard,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
         self._writer = writer
         self._schema_cache = schema_cache
         self._drift_detector = drift_detector
+        self._replay_guard = replay_guard
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -89,6 +92,7 @@ class SessionManager:
                 writer=self._writer,
                 cache=self._schema_cache,
                 detector=self._drift_detector,
+                replay=self._replay_guard,
                 send_upstream=send_upstream,
             ),
         )

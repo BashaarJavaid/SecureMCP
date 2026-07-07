@@ -39,6 +39,7 @@ from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
+from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class Interceptor:
     writer: AuditWriter
     cache: SchemaCache
     detector: DriftDetector
+    replay: ReplayGuard
     send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
@@ -121,6 +123,26 @@ class Interceptor:
     ) -> Forward | Respond:
         params = request.params or {}
         tool_name = str(params.get("name", ""))
+
+        # Replay Guard (§4.2 stage 1, cheapest check first): nonce + timestamp from
+        # params._meta; missing/invalid fields and a Redis failure all deny (§5).
+        meta = params.get("_meta") or {}
+        try:
+            replay_reason = await self.replay.check(
+                meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
+            )
+        except Exception:
+            logger.exception("replay check failed; denying (fail closed)")
+            replay_reason = "replay guard unavailable"
+        if replay_reason is not None:
+            return await self._deny(
+                request,
+                tool_name,
+                EventType.DENY_REPLAY,
+                f"Replay detected: {replay_reason}",
+                ["replay_guard"],
+            )
+
         if not self.engine.is_allowed(self.identity_id, settings.upstream_server_id, tool_name):
             return await self._deny_rbac(request, tool_name)
 
@@ -174,6 +196,11 @@ class Interceptor:
             return _error(
                 request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
             )
+        # The nonce/timestamp pair is gateway-facing only — it must not leak upstream.
+        meta.pop(NONCE_META_KEY, None)
+        meta.pop(TIMESTAMP_META_KEY, None)
+        if not meta:
+            params.pop("_meta", None)
         return Forward(message)
 
     async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:

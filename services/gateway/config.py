@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     schema_cache_ttl: int = 600
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5
+    # Half-width of the Replay Guard's accepted timestamp window (±30s, §4.8).
+    replay_window_seconds: int = 30
 
 
 settings = Settings()
