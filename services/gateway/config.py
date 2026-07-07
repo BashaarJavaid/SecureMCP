@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Policy name for the single upstream until a server registry exists.
     upstream_server_id: str = "default"
     policy_file: str = "policies/example-policy.yaml"
+    schema_cache_ttl: int = 600
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5
 
