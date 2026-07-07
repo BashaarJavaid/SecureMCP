@@ -28,7 +28,7 @@ async def clean_audit() -> None:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     try:
         await redis_client.ping()
-        await redis_client.delete(POINTER_KEY)
+        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
     except Exception:
         pytest.skip("redis not reachable — run: docker compose up -d redis")
     finally:
@@ -47,10 +47,33 @@ async def clean_audit() -> None:
 class Gateway:
     url: str
     keys: dict[str, str]  # identity id -> raw API key
+    policy_path: Path
 
 
 def _key_hash(key: str) -> str:
     return f"sha256:{hashlib.sha256(key.encode()).hexdigest()}"
+
+
+def policy_dict(
+    keys: dict[str, str], readonly_tools: list[str] | None = None, version: int = 1
+) -> dict:
+    return {
+        "version": version,
+        "identities": [
+            {
+                "id": "agent-readonly",
+                "api_key_hash": _key_hash(keys["agent-readonly"]),
+                "allowed_servers": [
+                    {"server_id": "default", "allowed_tools": readonly_tools or ["echo"]}
+                ],
+            },
+            {
+                "id": "agent-full",
+                "api_key_hash": _key_hash(keys["agent-full"]),
+                "allowed_servers": [{"server_id": "*", "allowed_tools": ["*"]}],
+            },
+        ],
+    }
 
 
 @pytest.fixture
@@ -61,23 +84,8 @@ async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
         "agent-readonly": secrets.token_urlsafe(32),
         "agent-full": secrets.token_urlsafe(32),
     }
-    policy = {
-        "version": 1,
-        "identities": [
-            {
-                "id": "agent-readonly",
-                "api_key_hash": _key_hash(keys["agent-readonly"]),
-                "allowed_servers": [{"server_id": "default", "allowed_tools": ["echo"]}],
-            },
-            {
-                "id": "agent-full",
-                "api_key_hash": _key_hash(keys["agent-full"]),
-                "allowed_servers": [{"server_id": "*", "allowed_tools": ["*"]}],
-            },
-        ],
-    }
     policy_path = tmp_path / "policy.yaml"
-    policy_path.write_text(yaml.safe_dump(policy))
+    policy_path.write_text(yaml.safe_dump(policy_dict(keys)))
 
     old_policy_file = settings.policy_file
     old_command = settings.upstream_command
@@ -92,7 +100,7 @@ async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
     while not server.started:
         await asyncio.sleep(0.05)
 
-    yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys)
+    yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
 
     settings.policy_file = old_policy_file
     settings.upstream_command = old_command

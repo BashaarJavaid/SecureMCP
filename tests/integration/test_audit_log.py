@@ -5,7 +5,8 @@ collide, and an unrecordable action is denied (§5)."""
 import asyncio
 import subprocess
 import sys
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import redis.asyncio as aioredis
@@ -90,7 +91,9 @@ async def test_verifier_passes_then_catches_tampering(gateway: Gateway) -> None:
 
 async def test_concurrent_writes_do_not_collide(clean_audit: None) -> None:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    writer = AuditWriter(redis_client, async_session, policy_version=1)
+    writer = AuditWriter(
+        redis_client, async_session, cast(Any, SimpleNamespace(engine=SimpleNamespace(version=1)))
+    )
     try:
         seqs = await asyncio.gather(
             *(writer.write(EventType.ALLOW, f"id-{i}", tool_name="echo") for i in range(50))

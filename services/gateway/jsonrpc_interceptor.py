@@ -10,10 +10,18 @@ tools/call is authorized here regardless of what the pruned tools/list showed: p
 shapes the LLM's planning surface, authorization happens fresh at the point of action
 (§4.1 design principle). Every decision point is audit-logged before it takes effect —
 an ALLOW that can't be recorded is a deny (§5, "no record, no action").
+
+Schemas come from the shared per-server cache (§8): populated whenever a tools/list
+response flows through, invalidated on initialize, and transparently re-fetched from
+the upstream on a miss (TTL expiry or a client that calls without listing).
 """
 
+import asyncio
 import logging
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from mcp.shared.message import SessionMessage
 from mcp.types import (
@@ -29,7 +37,8 @@ from services.gateway import param_validator, schema_pruner
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType
-from services.gateway.policy_engine import PolicyEngine
+from services.gateway.policy_engine import PolicyEngine, PolicyStore
+from services.gateway.schema_cache import SchemaCache
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,7 @@ POLICY_DENIED_CODE = -32003
 AUDIT_UNAVAILABLE_CODE = -32004
 
 _HANDLED_METHODS = frozenset({"initialize", "tools/list", "tools/call"})
+_REFETCH_TIMEOUT_S = 10
 
 
 @dataclass
@@ -72,12 +82,20 @@ def _error(request_id: RequestId, code: int, message: str, data: object = None) 
 @dataclass
 class Interceptor:
     identity_id: str
-    engine: PolicyEngine
+    store: PolicyStore
     writer: AuditWriter
+    cache: SchemaCache
+    send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
-    # Per-session {tool_name: inputSchema}, filled from tools/list responses.
-    # Minimal stand-in for the shared TTL/ETag schema cache that item 7 builds.
-    _tool_schemas: dict[str, dict[str, object]] = field(default_factory=dict)
+    # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
+    # to these ids resolve a future and are never forwarded to the client.
+    _internal: dict[str, "asyncio.Future[dict[str, Any]]"] = field(default_factory=dict)
+
+    @property
+    def engine(self) -> PolicyEngine:
+        # Read through the store on every use so a SIGHUP reload takes effect on the
+        # very next request of an in-flight session (§8).
+        return self.store.engine
 
     async def on_client_message(self, message: SessionMessage) -> Forward | Respond:
         root = message.message.root
@@ -87,9 +105,12 @@ class Interceptor:
                 logger.info("passthrough (no handler): %s", method)
             return Forward(message)
         self._pending[root.id] = root.method
-        if root.method == "tools/call":
+        if root.method == "initialize":
+            # A fresh handshake is the trust boundary to re-verify against (§8).
+            await self.cache.invalidate(settings.upstream_server_id)
+        elif root.method == "tools/call":
             return await self._authorize_call(message, root)
-        if root.method not in _HANDLED_METHODS:
+        elif root.method not in _HANDLED_METHODS:
             logger.info("passthrough (no handler): %s", root.method)
         return Forward(message)
 
@@ -101,13 +122,13 @@ class Interceptor:
         if not self.engine.is_allowed(self.identity_id, settings.upstream_server_id, tool_name):
             return await self._deny_rbac(request, tool_name)
 
-        # Parameter validation (§4.2 stage 7, §4.8): cached schema required — a call for
-        # a never-listed tool fails closed rather than skipping validation.
+        # Parameter validation (§4.2 stage 7, §4.8): cache miss triggers a transparent
+        # upstream re-fetch (§8); only an unfetchable schema fails closed.
         arguments = params.get("arguments", {}) or {}
-        input_schema = self._tool_schemas.get(tool_name)
+        input_schema = await self._input_schema_for(tool_name)
         if input_schema is None:
             return await self._deny_validation(
-                request, tool_name, "no cached input_schema for this tool; issue tools/list first"
+                request, tool_name, "tool schema unavailable from upstream"
             )
         error = param_validator.validate(arguments, input_schema)
         if error is not None:
@@ -133,6 +154,40 @@ class Interceptor:
                 request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
             )
         return Forward(message)
+
+    async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:
+        tools = await self.cache.get(settings.upstream_server_id)
+        if tools is None:
+            tools = await self._refetch_tools()
+            if tools is None:
+                return None
+        for tool in tools:
+            if tool.get("name") == tool_name:
+                schema: dict[str, Any] = tool.get("inputSchema", {})
+                return schema
+        return None  # RBAC-allowed but the upstream doesn't expose it — fail closed
+
+    async def _refetch_tools(self) -> list[dict[str, Any]] | None:
+        """Gateway-initiated tools/list (§8 TTL expiry / cache miss). Phase 2's drift
+        check (item 9) runs here on the re-fetched schema."""
+        request_id = f"securmcp:{uuid.uuid4().hex}"
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._internal[request_id] = future
+        try:
+            await self.send_upstream(
+                JSONRPCMessage(
+                    JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/list")
+                )
+            )
+            result = await asyncio.wait_for(future, timeout=_REFETCH_TIMEOUT_S)
+        except Exception:
+            logger.exception("transparent tools/list re-fetch failed")
+            return None
+        finally:
+            self._internal.pop(request_id, None)
+        tools: list[dict[str, Any]] = result.get("tools", [])
+        await self.cache.put(settings.upstream_server_id, tools)
+        return tools
 
     async def _deny_validation(
         self, request: JSONRPCRequest, tool_name: str, reason: str
@@ -192,13 +247,25 @@ class Interceptor:
             data=decision.model_dump(mode="json"),
         )
 
-    async def on_upstream_message(self, message: SessionMessage) -> SessionMessage:
+    async def on_upstream_message(self, message: SessionMessage) -> SessionMessage | None:
+        """Returns the message to serve to the client, or None to swallow it
+        (responses to gateway-initiated internal requests)."""
         root = message.message.root
         if isinstance(root, JSONRPCResponse):
+            if isinstance(root.id, str) and root.id in self._internal:
+                future = self._internal[root.id]
+                if not future.done():
+                    future.set_result(root.result)
+                return None
             method = self._pending.pop(root.id, None)
             if method == "tools/list":
                 return await self._prune_tools_list(message, root)
         elif isinstance(root, JSONRPCError):
+            if isinstance(root.id, str) and root.id in self._internal:
+                future = self._internal[root.id]
+                if not future.done():
+                    future.set_exception(RuntimeError(root.error.message))
+                return None
             self._pending.pop(root.id, None)
         return message
 
@@ -206,12 +273,14 @@ class Interceptor:
         self, message: SessionMessage, response: JSONRPCResponse
     ) -> SessionMessage:
         full = response.result.get("tools", [])
-        for tool in full:
-            self._tool_schemas[str(tool.get("name"))] = tool.get("inputSchema", {})
+        schema_hash = await self.cache.put(settings.upstream_server_id, full)
         served = schema_pruner.prune(
             full, self.identity_id, settings.upstream_server_id, self.engine
         )
         response.result["tools"] = served
+        # §8 ETag, realized as result metadata (per-message conditional HTTP semantics
+        # don't exist over the streamed transport).
+        response.result["_meta"] = {"etag": f"{self.engine.version}-{schema_hash}"}
         served_names = [str(tool.get("name")) for tool in served]
         pruned_names = [str(t.get("name")) for t in full if t not in served]
         try:

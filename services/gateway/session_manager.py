@@ -16,13 +16,15 @@ import redis.asyncio as aioredis
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage
 
 from services.gateway import upstream_client
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Interceptor, Respond
-from services.gateway.policy_engine import PolicyEngine
+from services.gateway.policy_engine import PolicyStore
+from services.gateway.schema_cache import SchemaCache
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +47,16 @@ class Session:
 
 class SessionManager:
     def __init__(
-        self, redis_client: aioredis.Redis, policy: PolicyEngine, writer: AuditWriter
+        self,
+        redis_client: aioredis.Redis,
+        policy_store: PolicyStore,
+        writer: AuditWriter,
+        schema_cache: SchemaCache,
     ) -> None:
         self._redis = redis_client
-        self._policy = policy
+        self._policy_store = policy_store
         self._writer = writer
+        self._schema_cache = schema_cache
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -65,12 +72,20 @@ class SessionManager:
         )
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
         process = await upstream_client.spawn(settings.upstream_command)
+
+        async def send_upstream(message: JSONRPCMessage) -> None:
+            await upstream_client.write_message(process, message)
+
         session = Session(
             id=session_id,
             transport=transport,
             process=process,
             interceptor=Interceptor(
-                identity_id=identity_id, engine=self._policy, writer=self._writer
+                identity_id=identity_id,
+                store=self._policy_store,
+                writer=self._writer,
+                cache=self._schema_cache,
+                send_upstream=send_upstream,
             ),
         )
         self._sessions[session_id] = session
@@ -128,7 +143,8 @@ class SessionManager:
     ) -> None:
         async for message in upstream_client.read_messages(session.process):
             outcome = await session.interceptor.on_upstream_message(SessionMessage(message))
-            await write_stream.send(outcome)
+            if outcome is not None:  # None = response to a gateway-internal request
+                await write_stream.send(outcome)
 
     async def _touch(self, session_id: str) -> None:
         await self._redis.set(

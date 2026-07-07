@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -22,6 +24,14 @@ POLICY = PolicyFile.model_validate(
     }
 )
 
+ECHO_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+}
+
+FAKE_HASH = "cafe" * 16
+
 
 class FakeWriter:
     def __init__(self) -> None:
@@ -39,23 +49,42 @@ class FakeWriter:
         return 42
 
 
-ECHO_SCHEMA = {
-    "type": "object",
-    "properties": {"text": {"type": "string"}},
-    "required": ["text"],
-}
+class FakeCache:
+    def __init__(self) -> None:
+        self.data: dict[str, list[dict[str, Any]]] = {}
+        self.invalidated: list[str] = []
+
+    async def get(self, server_id: str) -> list[dict[str, Any]] | None:
+        return self.data.get(server_id)
+
+    async def put(self, server_id: str, tools: list[dict[str, Any]]) -> str:
+        self.data[server_id] = tools
+        return FAKE_HASH
+
+    async def invalidate(self, server_id: str) -> None:
+        self.data.pop(server_id, None)
+        self.invalidated.append(server_id)
+
+
+async def _no_upstream(message: JSONRPCMessage) -> None:
+    raise AssertionError("unexpected gateway-initiated upstream send")
 
 
 def make_interceptor(
     identity: str = "agent-readonly", with_schema: bool = True
-) -> tuple[Interceptor, FakeWriter]:
+) -> tuple[Interceptor, FakeWriter, FakeCache]:
     writer = FakeWriter()
-    interceptor = Interceptor(
-        identity_id=identity, engine=PolicyEngine(POLICY), writer=cast(Any, writer)
-    )
+    cache = FakeCache()
     if with_schema:
-        interceptor._tool_schemas["echo"] = ECHO_SCHEMA
-    return interceptor, writer
+        cache.data["default"] = [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
+    interceptor = Interceptor(
+        identity_id=identity,
+        store=cast(Any, SimpleNamespace(engine=PolicyEngine(POLICY))),
+        writer=cast(Any, writer),
+        cache=cast(Any, cache),
+        send_upstream=_no_upstream,
+    )
+    return interceptor, writer, cache
 
 
 def request(method: str, params: dict | None = None, id: int = 1) -> SessionMessage:  # noqa: A002
@@ -68,7 +97,7 @@ async def test_unhandled_method_passes_through_unmodified_but_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     message = request("weird/unknown", {"x": 1})
-    interceptor, _ = make_interceptor()
+    interceptor, _, _ = make_interceptor()
     with caplog.at_level(logging.INFO, logger="services.gateway.jsonrpc_interceptor"):
         outcome = await interceptor.on_client_message(message)
 
@@ -78,7 +107,7 @@ async def test_unhandled_method_passes_through_unmodified_but_logged(
 
 
 async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
-    interceptor, writer = make_interceptor()
+    interceptor, writer, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "delete_repo", "arguments": {}})
     )
@@ -94,7 +123,7 @@ async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> No
 
 
 async def test_authorized_tools_call_is_audited_then_forwarded() -> None:
-    interceptor, writer = make_interceptor()
+    interceptor, writer, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
     )
@@ -103,7 +132,7 @@ async def test_authorized_tools_call_is_audited_then_forwarded() -> None:
 
 
 async def test_allow_that_cannot_be_recorded_is_denied() -> None:
-    interceptor, writer = make_interceptor()
+    interceptor, writer, _ = make_interceptor()
 
     async def broken_write(*args: Any, **kwargs: Any) -> int:
         raise ConnectionError("postgres down")
@@ -115,8 +144,58 @@ async def test_allow_that_cannot_be_recorded_is_denied() -> None:
     assert isinstance(outcome, Respond)  # no record, no action (§5)
 
 
-async def test_call_without_cached_schema_is_denied_validation() -> None:
-    interceptor, writer = make_interceptor(with_schema=False)
+async def test_initialize_invalidates_schema_cache() -> None:
+    interceptor, _, cache = make_interceptor()
+    outcome = await interceptor.on_client_message(request("initialize", {}))
+    assert isinstance(outcome, Forward)
+    assert cache.invalidated == ["default"]
+
+
+async def test_cache_miss_triggers_transparent_refetch_then_forwards() -> None:
+    interceptor, writer, cache = make_interceptor(with_schema=False)
+    sent: list[JSONRPCMessage] = []
+
+    async def capture(message: JSONRPCMessage) -> None:
+        sent.append(message)
+
+    interceptor.send_upstream = capture
+    task = asyncio.create_task(
+        interceptor.on_client_message(
+            request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+        )
+    )
+    while not sent:  # wait for the gateway's own tools/list to go out
+        await asyncio.sleep(0.01)
+    internal_id = sent[0].root.id
+    assert str(internal_id).startswith("securmcp:")
+
+    swallowed = await interceptor.on_upstream_message(
+        SessionMessage(
+            JSONRPCMessage(
+                JSONRPCResponse(
+                    jsonrpc="2.0",
+                    id=internal_id,
+                    result={"tools": [{"name": "echo", "inputSchema": ECHO_SCHEMA}]},
+                )
+            )
+        )
+    )
+    assert swallowed is None  # internal responses never reach the client
+
+    outcome = await task
+    assert isinstance(outcome, Forward)
+    assert cache.data["default"] == [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
+    assert writer.events == [EventType.ALLOW]
+
+
+async def test_failed_refetch_is_denied_validation() -> None:
+    interceptor, writer, _ = make_interceptor(with_schema=False)
+    # send_upstream raises (default _no_upstream would too, but be explicit)
+
+    async def broken(message: JSONRPCMessage) -> None:
+        raise BrokenPipeError("upstream gone")
+
+    interceptor.send_upstream = broken
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
     )
@@ -126,7 +205,7 @@ async def test_call_without_cached_schema_is_denied_validation() -> None:
 
 
 async def test_invalid_arguments_are_denied_and_audited() -> None:
-    interceptor, writer = make_interceptor()
+    interceptor, writer, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi", "bogus": 1}})
     )
@@ -139,15 +218,15 @@ async def test_invalid_arguments_are_denied_and_audited() -> None:
 
 
 async def test_forwarded_arguments_are_sanitized() -> None:
-    interceptor, _ = make_interceptor()
+    interceptor, _, _ = make_interceptor()
     message = request("tools/call", {"name": "echo", "arguments": {"text": "../a\x00b"}})
     outcome = await interceptor.on_client_message(message)
     assert isinstance(outcome, Forward)
     assert outcome.message.message.root.params["arguments"] == {"text": "ab"}
 
 
-async def test_tools_list_response_is_pruned_and_audited() -> None:
-    interceptor, writer = make_interceptor()
+async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
+    interceptor, writer, cache = make_interceptor(with_schema=False)
     await interceptor.on_client_message(request("tools/list", id=7))
     response = SessionMessage(
         JSONRPCMessage(
@@ -161,5 +240,8 @@ async def test_tools_list_response_is_pruned_and_audited() -> None:
 
     out = await interceptor.on_upstream_message(response)
 
+    assert out is not None
     assert out.message.root.result["tools"] == [{"name": "echo"}]
+    assert out.message.root.result["_meta"] == {"etag": f"1-{FAKE_HASH}"}
+    assert cache.data["default"] == [{"name": "echo"}, {"name": "delete_repo"}]
     assert writer.events == [EventType.TOOLS_LIST]
