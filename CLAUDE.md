@@ -36,10 +36,11 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 - `.venv/bin/pytest` — tests
 - `.venv/bin/ruff check .` — lint
 - `.venv/bin/mypy services/` — strict type-check
+- `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1, items 1–4 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth on every request). Item 5 (audit log writer with hash chaining) is next.
+See `ROADMAP.md`. Phase 1, items 1–5 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier). Item 6 (Parameter Validator on `tools/call`) is next.
 
 ---
 
