@@ -30,8 +30,13 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      # UPSTREAM_COMMAND: set when sample_target lands (ROADMAP Phase 1, item 8),
-      # e.g. "python sample_target/overscoped_server.py"
+      # stdio upstream, spawned per session inside this container (rogue_server in
+      # Phase 2 gets its own service — it needs an admin HTTP endpoint).
+      UPSTREAM_COMMAND: ${UPSTREAM_COMMAND:-python sample_target/overscoped_server.py}
+      POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
+    volumes:
+      # Host-editable policies: edit + `docker kill -s HUP securemcp-gateway-1` to reload.
+      - ./policies:/app/policies:ro
     ports:
       - "8000:8000"
     depends_on:

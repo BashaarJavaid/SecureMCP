@@ -1,14 +1,16 @@
 # RBAC-only policy (Phase 1, item 3). ABAC `conditions` are rejected until Phase 3, item 17.
-# api_key_hash values below are non-functional placeholders — mint a real key/hash pair
-# with: python scripts/generate_api_key.py
+# The identities below are the demo cast for sample_target/overscoped_server.py.
+# api_key_hash values are non-functional placeholders — mint a real key/hash pair with:
+#   python scripts/generate_api_key.py
+# (or run `python scripts/run_demo.py`, which writes policies/demo-policy.yaml with real keys)
 version: 1
 identities:
-  - id: "agent-readonly"
+  - id: "developer"
     api_key_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     allowed_servers:
       - server_id: "default"
-        allowed_tools: ["echo"]
-  - id: "agent-full"
+        allowed_tools: ["read_file", "list_issues"]
+  - id: "ops-admin"
     api_key_hash: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     allowed_servers:
       - server_id: "*"

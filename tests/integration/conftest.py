@@ -4,6 +4,7 @@ import secrets
 import socket
 import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,21 +77,15 @@ def policy_dict(
     }
 
 
-@pytest.fixture
-async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
-    """The gateway app on an ephemeral port: echo fixture upstream, and a policy file
-    generated at runtime so no real-looking API keys ever land in the repo."""
-    keys = {
-        "agent-readonly": secrets.token_urlsafe(32),
-        "agent-full": secrets.token_urlsafe(32),
-    }
-    policy_path = tmp_path / "policy.yaml"
-    policy_path.write_text(yaml.safe_dump(policy_dict(keys)))
-
+@asynccontextmanager
+async def running_gateway(
+    policy_path: Path, upstream_command: str, keys: dict[str, str]
+) -> AsyncIterator[Gateway]:
+    """The gateway app on an ephemeral port with the given policy file and upstream."""
     old_policy_file = settings.policy_file
     old_command = settings.upstream_command
     settings.policy_file = str(policy_path)
-    settings.upstream_command = f"{sys.executable} {ECHO_SERVER}"
+    settings.upstream_command = upstream_command
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -100,9 +95,24 @@ async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
     while not server.started:
         await asyncio.sleep(0.05)
 
-    yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
+    try:
+        yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
+    finally:
+        settings.policy_file = old_policy_file
+        settings.upstream_command = old_command
+        server.should_exit = True
+        await task
 
-    settings.policy_file = old_policy_file
-    settings.upstream_command = old_command
-    server.should_exit = True
-    await task
+
+@pytest.fixture
+async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
+    """Echo fixture upstream, with a policy file generated at runtime so no
+    real-looking API keys ever land in the repo."""
+    keys = {
+        "agent-readonly": secrets.token_urlsafe(32),
+        "agent-full": secrets.token_urlsafe(32),
+    }
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(yaml.safe_dump(policy_dict(keys)))
+    async with running_gateway(policy_path, f"{sys.executable} {ECHO_SERVER}", keys) as gw:
+        yield gw
