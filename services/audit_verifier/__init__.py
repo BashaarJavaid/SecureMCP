@@ -1,0 +1,1 @@
+"""Standalone audit-chain verifier."""
