@@ -39,11 +39,22 @@ class FakeWriter:
         return 42
 
 
-def make_interceptor(identity: str = "agent-readonly") -> tuple[Interceptor, FakeWriter]:
+ECHO_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+}
+
+
+def make_interceptor(
+    identity: str = "agent-readonly", with_schema: bool = True
+) -> tuple[Interceptor, FakeWriter]:
     writer = FakeWriter()
     interceptor = Interceptor(
         identity_id=identity, engine=PolicyEngine(POLICY), writer=cast(Any, writer)
     )
+    if with_schema:
+        interceptor._tool_schemas["echo"] = ECHO_SCHEMA
     return interceptor, writer
 
 
@@ -102,6 +113,37 @@ async def test_allow_that_cannot_be_recorded_is_denied() -> None:
         request("tools/call", {"name": "echo", "arguments": {}})
     )
     assert isinstance(outcome, Respond)  # no record, no action (§5)
+
+
+async def test_call_without_cached_schema_is_denied_validation() -> None:
+    interceptor, writer = make_interceptor(with_schema=False)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_VALIDATION"
+    assert writer.events == [EventType.DENY_VALIDATION]
+
+
+async def test_invalid_arguments_are_denied_and_audited() -> None:
+    interceptor, writer = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi", "bogus": 1}})
+    )
+    assert isinstance(outcome, Respond)
+    error = outcome.message.message.root
+    assert error.error.data["event_type"] == "DENY_VALIDATION"
+    assert error.error.data["audit_id"] == "42"
+    assert "bogus" in error.error.message
+    assert writer.events == [EventType.DENY_VALIDATION]
+
+
+async def test_forwarded_arguments_are_sanitized() -> None:
+    interceptor, _ = make_interceptor()
+    message = request("tools/call", {"name": "echo", "arguments": {"text": "../a\x00b"}})
+    outcome = await interceptor.on_client_message(message)
+    assert isinstance(outcome, Forward)
+    assert outcome.message.message.root.params["arguments"] == {"text": "ab"}
 
 
 async def test_tools_list_response_is_pruned_and_audited() -> None:

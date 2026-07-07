@@ -110,6 +110,7 @@ async def test_unrecordable_call_is_denied(
     gateway: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
+        await session.list_tools()  # prime the schema cache before breaking the writer
         writer = app.state.session_manager._writer
 
         async def broken_write(*args: Any, **kwargs: Any) -> int:

@@ -25,7 +25,7 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import schema_pruner
+from services.gateway import param_validator, schema_pruner
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType
@@ -75,6 +75,9 @@ class Interceptor:
     engine: PolicyEngine
     writer: AuditWriter
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
+    # Per-session {tool_name: inputSchema}, filled from tools/list responses.
+    # Minimal stand-in for the shared TTL/ETag schema cache that item 7 builds.
+    _tool_schemas: dict[str, dict[str, object]] = field(default_factory=dict)
 
     async def on_client_message(self, message: SessionMessage) -> Forward | Respond:
         root = message.message.root
@@ -97,13 +100,31 @@ class Interceptor:
         tool_name = str(params.get("name", ""))
         if not self.engine.is_allowed(self.identity_id, settings.upstream_server_id, tool_name):
             return await self._deny_rbac(request, tool_name)
+
+        # Parameter validation (§4.2 stage 7, §4.8): cached schema required — a call for
+        # a never-listed tool fails closed rather than skipping validation.
+        arguments = params.get("arguments", {}) or {}
+        input_schema = self._tool_schemas.get(tool_name)
+        if input_schema is None:
+            return await self._deny_validation(
+                request, tool_name, "no cached input_schema for this tool; issue tools/list first"
+            )
+        error = param_validator.validate(arguments, input_schema)
+        if error is not None:
+            return await self._deny_validation(request, tool_name, error)
+        arguments, sanitized_fields = param_validator.sanitize(arguments)
+        params["arguments"] = arguments
+
         # ALLOW is recorded before the call is forwarded — no record, no action (§5).
+        payload_extra: dict[str, object] = {"arguments": arguments}
+        if sanitized_fields:
+            payload_extra["sanitized_fields"] = sanitized_fields
         try:
             await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
                 tool_name=tool_name,
-                payload_extra={"arguments": params.get("arguments", {})},
+                payload_extra=payload_extra,
             )
         except Exception:
             logger.exception("audit write failed; denying tools/call %r (fail closed)", tool_name)
@@ -112,6 +133,36 @@ class Interceptor:
                 request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
             )
         return Forward(message)
+
+    async def _deny_validation(
+        self, request: JSONRPCRequest, tool_name: str, reason: str
+    ) -> Respond:
+        self._pending.pop(request.id, None)
+        decision = Decision(
+            decision=DecisionOutcome.DENY,
+            event_type=EventType.DENY_VALIDATION,
+            reason=f"invalid arguments for {tool_name!r}: {reason}",
+            matched_rules=["param_validator"],
+            policy_version=self.engine.version,
+        )
+        logger.info("DENY_VALIDATION: %s", decision.reason)
+        try:
+            seq = await self.writer.write(
+                EventType.DENY_VALIDATION,
+                self.identity_id,
+                tool_name=tool_name,
+                payload_extra={"reason": decision.reason},
+            )
+            decision.audit_id = str(seq)
+        except Exception:
+            # The deny still stands; only the record of it failed. Log loudly.
+            logger.exception("audit write failed for DENY_VALIDATION on %r", tool_name)
+        return _error(
+            request.id,
+            POLICY_DENIED_CODE,
+            decision.reason,
+            data=decision.model_dump(mode="json"),
+        )
 
     async def _deny_rbac(self, request: JSONRPCRequest, tool_name: str) -> Respond:
         self._pending.pop(request.id, None)
@@ -155,6 +206,8 @@ class Interceptor:
         self, message: SessionMessage, response: JSONRPCResponse
     ) -> SessionMessage:
         full = response.result.get("tools", [])
+        for tool in full:
+            self._tool_schemas[str(tool.get("name"))] = tool.get("inputSchema", {})
         served = schema_pruner.prune(
             full, self.identity_id, settings.upstream_server_id, self.engine
         )
