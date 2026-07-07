@@ -9,19 +9,20 @@ Usage:
 """
 
 import asyncio
-import logging
 import os
 import sys
 from pathlib import Path
 
+import structlog
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from services.gateway import signing  # noqa: E402
+from services.gateway import logging_config, signing  # noqa: E402
 from services.gateway.audit_verifier import verify_increment  # noqa: E402
 from services.gateway.config import settings  # noqa: E402
 from services.gateway.db import async_session, engine  # noqa: E402
 
-logger = logging.getLogger("audit_verifier_daemon")
+logger = structlog.get_logger("audit_verifier_daemon")
 
 
 async def main() -> int:
@@ -32,7 +33,7 @@ async def main() -> int:
         while True:
             verified, failure = await verify_increment(async_session, public_key)
             # Heartbeat: a silent daemon is indistinguishable from a dead one (§5 table).
-            logger.info("pass complete: %d row(s) verified, failure=%s", verified, failure)
+            logger.info("pass_complete", verified_rows=verified, failure=failure)
             if once:
                 return 1 if failure is not None else 0
             await asyncio.sleep(interval)
@@ -41,5 +42,5 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    logging_config.configure()
     sys.exit(asyncio.run(main()))

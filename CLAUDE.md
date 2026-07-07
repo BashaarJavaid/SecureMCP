@@ -44,7 +44,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint), and 12 (benchmark suite: `python -m tests.benchmarks.run`, measured numbers in the README's Performance section) are done; item 13 (structured logging with structlog) is next.
+See `ROADMAP.md`. Phase 1 is complete (items 1–8). Phase 2: items 9 (Drift Detector), 10 (Replay Guard: `securmcp/nonce` + `securmcp/timestamp` in `tools/call` `params._meta`, Redis `SET NX` dedup, fail-closed as `DENY_REPLAY` at pipeline stage 1), 11 (ECDSA P-256 signing on every audit row — key minted via `scripts/generate_signing_key.py`, gateway fails startup without it; incremental verifier daemon with a Postgres `last_verified_seq` checkpoint), 12 (benchmark suite: `python -m tests.benchmarks.run`, measured numbers in the README's Performance section), and 13 (structlog JSON logging end to end — `services/gateway/logging_config.py`, decision lines correlated by session id) are done; item 14 (`sample_target/rogue_server.py` + updated demo recording) is next.
 
 ---
 

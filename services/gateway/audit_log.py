@@ -15,11 +15,11 @@ caller must deny.
 
 import asyncio
 import hashlib
-import logging
 from typing import Any
 
 import canonicaljson
 import redis.asyncio as aioredis
+import structlog
 from cryptography.hazmat.primitives.asymmetric import ec
 from redis.exceptions import WatchError
 from sqlalchemy import select
@@ -31,7 +31,7 @@ from services.gateway.db import AuditLog
 from services.gateway.decision import EventType
 from services.gateway.policy_engine import PolicyStore
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 GENESIS_HASH = "0" * 64
 POINTER_KEY = "latest_audit_hash"

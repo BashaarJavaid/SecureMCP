@@ -9,10 +9,15 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
+from services.gateway import logging_config
 from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
+
+# Route structlog through stdlib so caplog sees the records (main.py does this in
+# production; unit tests never import main).
+logging_config.configure()
 
 POLICY = PolicyFile.model_validate(
     {
@@ -110,6 +115,7 @@ def make_interceptor(
         cache.data["default"] = [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
     interceptor = Interceptor(
         identity_id=identity,
+        session_id="test-session",
         store=cast(Any, SimpleNamespace(engine=PolicyEngine(POLICY))),
         writer=cast(Any, writer),
         cache=cast(Any, cache),
@@ -143,6 +149,38 @@ async def test_unhandled_method_passes_through_unmodified_but_logged(
     assert isinstance(outcome, Forward)
     assert outcome.message is message  # passed through, not rebuilt
     assert "weird/unknown" in caplog.text
+
+
+async def test_decision_log_lines_are_structured_with_session_correlation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """§7: one line per decision, correlation id = session id — allow and deny alike."""
+    interceptor, _, _, _ = make_interceptor()
+    with caplog.at_level(logging.INFO, logger="services.gateway.jsonrpc_interceptor"):
+        allowed = await interceptor.on_client_message(
+            request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+        )
+        denied = await interceptor.on_client_message(
+            request("tools/call", {"name": "forbidden", "arguments": {}}, id=2)
+        )
+    assert isinstance(allowed, Forward)
+    assert isinstance(denied, Respond)
+
+    decisions = [
+        record.msg
+        for record in caplog.records
+        if isinstance(record.msg, dict) and record.msg.get("event") == "decision"
+    ]
+    assert [d["decision"] for d in decisions] == ["allow", "deny"]
+    allow_line, deny_line = decisions
+    assert allow_line["event_type"] == "ALLOW"
+    assert allow_line["tool"] == "echo"
+    assert deny_line["event_type"] == "DENY_RBAC"
+    assert deny_line["tool"] == "forbidden"
+    assert deny_line["audit_id"] == "42"  # FakeWriter's seq
+    for line in decisions:
+        assert line["session_id"] == "test-session"
+        assert line["identity"] == "agent-readonly"
 
 
 async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:

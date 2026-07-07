@@ -13,8 +13,7 @@ Prometheus counters are item 25). The daemon being down never blocks live traffi
 (§5): it is a detective control, not a preventive one.
 """
 
-import logging
-
+import structlog
 from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -23,7 +22,7 @@ from services.gateway import signing
 from services.gateway.audit_log import GENESIS_HASH, compute_hash
 from services.gateway.db import AuditLog, VerifierCheckpoint
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 CHECKPOINT_ID = 1
 
@@ -60,7 +59,7 @@ async def verify_increment(
             elif not signing.verify(public_key, row.signature, row.curr_hash):
                 failure = f"BAD SIGNATURE at seq={row.seq}: curr_hash was not signed by the gateway"
             if failure is not None:
-                logger.error("audit chain verification failed: %s", failure)
+                logger.error("audit_chain_verification_failed", failure=failure, seq=row.seq)
                 break
             prev_hash = row.curr_hash
             last_verified = row.seq

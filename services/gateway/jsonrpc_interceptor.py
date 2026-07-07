@@ -17,12 +17,12 @@ the upstream on a miss (TTL expiry or a client that calls without listing).
 """
 
 import asyncio
-import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
 from mcp.shared.message import SessionMessage
 from mcp.types import (
     ErrorData,
@@ -41,8 +41,6 @@ from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
 from services.gateway.schema_cache import SchemaCache
-
-logger = logging.getLogger(__name__)
 
 # Implementation-defined JSON-RPC error codes; the canonical Decision object (§4.3)
 # travels in error.data for policy denials.
@@ -84,6 +82,7 @@ def _error(request_id: RequestId, code: int, message: str, data: object = None) 
 @dataclass
 class Interceptor:
     identity_id: str
+    session_id: str
     store: PolicyStore
     writer: AuditWriter
     cache: SchemaCache
@@ -94,6 +93,14 @@ class Interceptor:
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
     # to these ids resolve a future and are never forwarded to the client.
     _internal: dict[str, "asyncio.Future[dict[str, Any]]"] = field(default_factory=dict)
+    _log: structlog.stdlib.BoundLogger = field(init=False)
+
+    def __post_init__(self) -> None:
+        # §7: correlation id = session id. Bound here because interceptor calls run in
+        # the per-session pump task, out of reach of request-scoped contextvars.
+        self._log = structlog.get_logger(__name__).bind(
+            session_id=self.session_id, identity=self.identity_id
+        )
 
     @property
     def engine(self) -> PolicyEngine:
@@ -106,7 +113,7 @@ class Interceptor:
         if not isinstance(root, JSONRPCRequest):
             method = getattr(root, "method", None)
             if method is not None and method not in _HANDLED_METHODS:
-                logger.info("passthrough (no handler): %s", method)
+                self._log.info("passthrough_no_handler", method=method)
             return Forward(message)
         self._pending[root.id] = root.method
         if root.method == "initialize":
@@ -115,7 +122,7 @@ class Interceptor:
         elif root.method == "tools/call":
             return await self._authorize_call(message, root)
         elif root.method not in _HANDLED_METHODS:
-            logger.info("passthrough (no handler): %s", root.method)
+            self._log.info("passthrough_no_handler", method=root.method)
         return Forward(message)
 
     async def _authorize_call(
@@ -132,7 +139,7 @@ class Interceptor:
                 meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
             )
         except Exception:
-            logger.exception("replay check failed; denying (fail closed)")
+            self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
             replay_reason = "replay guard unavailable"
         if replay_reason is not None:
             return await self._deny(
@@ -153,7 +160,7 @@ class Interceptor:
                 settings.upstream_server_id, tool_name
             )
         except Exception:
-            logger.exception("drift status lookup failed; denying (fail closed)")
+            self._log.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
             drift_blocked = True
         if drift_blocked:
             return await self._deny(
@@ -184,18 +191,25 @@ class Interceptor:
         if sanitized_fields:
             payload_extra["sanitized_fields"] = sanitized_fields
         try:
-            await self.writer.write(
+            seq = await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
             )
         except Exception:
-            logger.exception("audit write failed; denying tools/call %r (fail closed)", tool_name)
+            self._log.exception("audit_write_failed_fail_closed", tool=tool_name)
             self._pending.pop(request.id, None)
             return _error(
                 request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
             )
+        self._log.info(
+            "decision",
+            decision="allow",
+            event_type=EventType.ALLOW.value,
+            tool=tool_name,
+            audit_id=str(seq),
+        )
         # The nonce/timestamp pair is gateway-facing only — it must not leak upstream.
         meta.pop(NONCE_META_KEY, None)
         meta.pop(TIMESTAMP_META_KEY, None)
@@ -232,7 +246,7 @@ class Interceptor:
             await self.detector.check(settings.upstream_server_id, tools, self.identity_id)
             await self.cache.put(settings.upstream_server_id, tools)
         except Exception:
-            logger.exception("transparent tools/list re-fetch failed")
+            self._log.exception("tools_list_refetch_failed")
             return None
         finally:
             self._internal.pop(request_id, None)
@@ -256,7 +270,6 @@ class Interceptor:
             matched_rules=matched_rules,
             policy_version=self.engine.version,
         )
-        logger.info("%s: %s", event_type.value, decision.reason)
         try:
             seq = await self.writer.write(
                 event_type,
@@ -266,7 +279,15 @@ class Interceptor:
             )
             decision.audit_id = str(seq)
         except Exception:
-            logger.exception("audit write failed for %s on %r", event_type.value, tool_name)
+            self._log.exception("audit_write_failed", event_type=event_type.value, tool=tool_name)
+        self._log.info(
+            "decision",
+            decision="deny",
+            event_type=event_type.value,
+            tool=tool_name,
+            reason=decision.reason,
+            audit_id=decision.audit_id,
+        )
         return _error(
             request.id,
             POLICY_DENIED_CODE,
@@ -323,7 +344,7 @@ class Interceptor:
         try:
             await self.detector.check(settings.upstream_server_id, full, self.identity_id)
         except Exception:
-            logger.exception("drift check failed; withholding tools/list (fail closed)")
+            self._log.exception("drift_check_failed_fail_closed")
             return _error(
                 response.id, AUDIT_UNAVAILABLE_CODE, "drift check unavailable; tools/list denied"
             ).message
@@ -344,7 +365,9 @@ class Interceptor:
                 payload_extra={"served_tools": served_names, "pruned_tools": pruned_names},
             )
         except Exception:
-            logger.exception("audit write failed; withholding tools/list (fail closed)")
+            self._log.exception(
+                "audit_write_failed_fail_closed", event_type=EventType.TOOLS_LIST.value
+            )
             return _error(
                 response.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; tools/list denied"
             ).message

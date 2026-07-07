@@ -9,11 +9,11 @@ Canonicalization is canonicaljson (pinned) — see the key-reordering smoke test
 """
 
 import hashlib
-import logging
 from enum import IntEnum
 from typing import Any
 
 import canonicaljson
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -21,7 +21,7 @@ from services.gateway.audit_log import AuditWriter
 from services.gateway.db import ToolBaseline
 from services.gateway.decision import EventType
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Sentinel stored in observed_hash while a baselined tool is absent from the live list,
 # so its removal (DRIFT_MEDIUM) is logged once, not on every poll.

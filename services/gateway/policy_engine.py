@@ -7,13 +7,13 @@ fails startup — fail closed (ARCHITECTURE.md §5).
 """
 
 import hashlib
-import logging
 from pathlib import Path
 
+import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class ServerGrant(BaseModel):
@@ -100,7 +100,7 @@ class PolicyStore:
         try:
             self.engine = load(self._path)
         except Exception:
-            logger.exception("policy reload failed; keeping last-known-good policy")
+            logger.exception("policy_reload_failed_keeping_last_known_good")
             return False
-        logger.info("policy reloaded: version %d", self.engine.version)
+        logger.info("policy_reloaded", version=self.engine.version)
         return True

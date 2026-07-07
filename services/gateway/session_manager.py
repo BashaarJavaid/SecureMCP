@@ -7,12 +7,12 @@ key rather than a per-request check.
 """
 
 import asyncio
-import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 
 import redis.asyncio as aioredis
+import structlog
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.message import SessionMessage
@@ -28,7 +28,7 @@ from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _SWEEP_INTERVAL_S = 30
 
@@ -88,6 +88,7 @@ class SessionManager:
             process=process,
             interceptor=Interceptor(
                 identity_id=identity_id,
+                session_id=session_id,
                 store=self._policy_store,
                 writer=self._writer,
                 cache=self._schema_cache,
@@ -121,7 +122,9 @@ class SessionManager:
                 for task in done:
                     if not task.cancelled() and task.exception() is not None:
                         logger.warning(
-                            "session %s pump failed: %r", session.id, task.exception()
+                            "session_pump_failed",
+                            session_id=session.id,
+                            error=repr(task.exception()),
                         )
         finally:
             session.ready.set()
@@ -162,7 +165,7 @@ class SessionManager:
     async def sweep_once(self) -> None:
         for session_id in list(self._sessions):
             if not await self._redis.exists(_last_seen_key(session_id)):
-                logger.info("session %s idle-expired, tearing down", session_id)
+                logger.info("session_idle_expired", session_id=session_id)
                 await self.teardown(session_id)
 
     async def sweep_loop(self) -> None:
@@ -186,7 +189,9 @@ class SessionManager:
                 except TimeoutError:
                     session.process.kill()
         except (ProcessLookupError, OSError):
-            logger.warning("session %s subprocess already gone during teardown", session_id)
+            logger.warning(
+                "session_subprocess_already_gone", session_id=session_id, during="teardown"
+            )
         await self._redis.delete(_last_seen_key(session_id))
 
     async def shutdown_all(self) -> None:
@@ -202,7 +207,9 @@ class SessionManager:
                 if session.process.returncode is None:
                     session.process.terminate()
             except (ProcessLookupError, OSError):
-                logger.warning("subprocess for session %s already gone", session.id)
+                logger.warning(
+                    "session_subprocess_already_gone", session_id=session.id, during="shutdown"
+                )
         alive = [s for s in sessions if s.process.returncode is None]
         if alive:
             await asyncio.wait(
@@ -214,4 +221,8 @@ class SessionManager:
                 try:
                     session.process.kill()
                 except (ProcessLookupError, OSError):
-                    logger.warning("subprocess for session %s already gone", session.id)
+                    logger.warning(
+                        "session_subprocess_already_gone",
+                        session_id=session.id,
+                        during="shutdown",
+                    )

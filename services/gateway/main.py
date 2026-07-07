@@ -1,18 +1,18 @@
 """FastAPI app entrypoint."""
 
 import asyncio
-import logging
 import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 import redis.asyncio as aioredis
+import structlog
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth, signing
+from services.gateway import auth, logging_config, signing
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import async_session
@@ -23,7 +23,8 @@ from services.gateway.replay_guard import ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
-logger = logging.getLogger(__name__)
+logging_config.configure()
+logger = structlog.get_logger(__name__)
 
 KEY_HEADER = "x-securmcp-key"
 
@@ -43,7 +44,7 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
             },
         )
     except Exception:
-        logger.exception("audit write failed for POLICY_ACTIVATED")
+        logger.exception("audit_write_failed", event_type="POLICY_ACTIVATED")
 
 
 @asynccontextmanager
@@ -149,7 +150,7 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         try:
             session = await manager.create(identity_id)
         except Exception:
-            logger.exception("session creation failed")
+            logger.exception("session_creation_failed", identity=identity_id)
             await Response("session could not be created", status_code=503)(
                 scope, receive, send
             )
