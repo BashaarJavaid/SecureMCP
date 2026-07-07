@@ -129,6 +129,21 @@ securmcp/
 
 ---
 
+## Running the demo (Phase 1: schema pruning)
+
+```bash
+python scripts/run_demo.py           # mints keys, writes policies/demo-policy.yaml, waits
+# in another terminal:
+POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build
+```
+
+The driver connects as `developer` (sees only `read_file`/`list_issues` — the destructive
+tools are absent, not marked), then as `ops-admin` (sees all four), then prints the
+hash-chained audit rows recording exactly what was pruned from whom. The full demo
+narrative below arrives feature-by-feature with later phases.
+
+---
+
 ## Demo Target (`sample_target/`)
 
 Two tiny MCP servers built specifically to make the gateway's value visible in a 30-second recording:

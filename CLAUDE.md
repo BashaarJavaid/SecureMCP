@@ -37,10 +37,11 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 - `.venv/bin/ruff check .` — lint
 - `.venv/bin/mypy services/` — strict type-check
 - `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain
+- `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build` — the schema-pruning demo
 
 ## Current phase
 
-See `ROADMAP.md`. Phase 1, items 1–7 are done (scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier; Parameter Validator; cache invalidation with SIGHUP policy hot-reload). Item 8 (`sample_target/overscoped_server.py` + first recorded demo) is next and closes Phase 1.
+See `ROADMAP.md`. **Phase 1 is complete** (items 1–8: scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier; Parameter Validator; cache invalidation with SIGHUP hot-reload; overscoped demo server + verified demo driver). Phase 2 starts with item 9 (Drift Detector with severity classification) — its hook point is the schema re-fetch in `jsonrpc_interceptor.py`.
 
 ---
 
