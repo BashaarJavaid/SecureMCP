@@ -49,4 +49,5 @@ class Decision(BaseModel):
     risk_score: int | None = None
     risk_factors: list[RiskFactor] | None = None
     policy_version: int
-    audit_id: str
+    # None until the audit log writer lands (Phase 1, item 5).
+    audit_id: str | None = None

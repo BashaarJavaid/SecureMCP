@@ -10,14 +10,20 @@ from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
+from services.gateway import policy_engine
 from services.gateway.config import settings
 from services.gateway.session_manager import SessionManager
+
+# Temporary, unverified identity header — replaced by X-SecurMCP-Key auth in item 4.
+IDENTITY_HEADER = "x-securmcp-identity"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5).
+    policy = policy_engine.load(settings.policy_file)
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    manager = SessionManager(redis_client)
+    manager = SessionManager(redis_client, policy)
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
     try:
@@ -51,7 +57,7 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     elif scope["method"] == "POST":
         # A POST without a session header is a new session (the initialize request).
         try:
-            session = await manager.create()
+            session = await manager.create(headers.get(IDENTITY_HEADER))
         except RuntimeError as exc:
             await Response(str(exc), status_code=503)(scope, receive, send)
             return

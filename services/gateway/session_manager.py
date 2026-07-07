@@ -17,8 +17,10 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.message import SessionMessage
 
-from services.gateway import jsonrpc_interceptor, upstream_client
+from services.gateway import upstream_client
 from services.gateway.config import settings
+from services.gateway.jsonrpc_interceptor import Interceptor, Respond
+from services.gateway.policy_engine import PolicyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -34,25 +36,32 @@ class Session:
     id: str
     transport: StreamableHTTPServerTransport
     process: asyncio.subprocess.Process
+    interceptor: Interceptor
     task: asyncio.Task[None] | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class SessionManager:
-    def __init__(self, redis_client: aioredis.Redis) -> None:
+    def __init__(self, redis_client: aioredis.Redis, policy: PolicyEngine) -> None:
         self._redis = redis_client
+        self._policy = policy
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    async def create(self) -> Session:
+    async def create(self, identity_id: str | None) -> Session:
         if not settings.upstream_command:
             raise RuntimeError("UPSTREAM_COMMAND is not configured")
         session_id = uuid.uuid4().hex
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
         process = await upstream_client.spawn(settings.upstream_command)
-        session = Session(id=session_id, transport=transport, process=process)
+        session = Session(
+            id=session_id,
+            transport=transport,
+            process=process,
+            interceptor=Interceptor(identity_id=identity_id, engine=self._policy),
+        )
         self._sessions[session_id] = session
         await self._touch(session_id)
         session.task = asyncio.create_task(self._run(session))
@@ -65,7 +74,9 @@ class SessionManager:
             async with session.transport.connect() as (read_stream, write_stream):
                 session.ready.set()
                 pumps = [
-                    asyncio.create_task(self._client_to_upstream(session, read_stream)),
+                    asyncio.create_task(
+                        self._client_to_upstream(session, read_stream, write_stream)
+                    ),
                     asyncio.create_task(self._upstream_to_client(session, write_stream)),
                 ]
                 # Either direction ending (client disconnect, upstream exit, Redis failure —
@@ -86,13 +97,18 @@ class SessionManager:
         self,
         session: Session,
         read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
+        write_stream: MemoryObjectSendStream[SessionMessage],
     ) -> None:
         async for item in read_stream:
             if isinstance(item, Exception):
                 raise item
             await self._touch(session.id)
-            message = await jsonrpc_interceptor.dispatch(item)
-            await upstream_client.write_message(session.process, message.message)
+            outcome = session.interceptor.on_client_message(item)
+            if isinstance(outcome, Respond):
+                # Terminal decision (e.g. DENY_RBAC): answer the client directly.
+                await write_stream.send(outcome.message)
+            else:
+                await upstream_client.write_message(session.process, outcome.message.message)
 
     async def _upstream_to_client(
         self,
@@ -100,7 +116,8 @@ class SessionManager:
         write_stream: MemoryObjectSendStream[SessionMessage],
     ) -> None:
         async for message in upstream_client.read_messages(session.process):
-            await write_stream.send(SessionMessage(message))
+            outcome = session.interceptor.on_upstream_message(SessionMessage(message))
+            await write_stream.send(outcome)
 
     async def _touch(self, session_id: str) -> None:
         await self._redis.set(

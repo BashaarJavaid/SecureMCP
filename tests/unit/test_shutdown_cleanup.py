@@ -28,9 +28,14 @@ class FakeProcess:
 
 
 def make_manager_with(processes: list[FakeProcess]) -> SessionManager:
-    manager = SessionManager(cast(Any, None))  # redis unused by shutdown_all
+    manager = SessionManager(cast(Any, None), cast(Any, None))  # redis/policy unused here
     for i, process in enumerate(processes):
-        session = Session(id=f"s{i}", transport=cast(Any, None), process=cast(Any, process))
+        session = Session(
+            id=f"s{i}",
+            transport=cast(Any, None),
+            process=cast(Any, process),
+            interceptor=cast(Any, None),
+        )
         manager._sessions[session.id] = session
     return manager
 

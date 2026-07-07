@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # Single upstream MCP server, spawned per session as a stdio subprocess (ROADMAP item 2:
     # one hardcoded upstream, no server registry). Empty = session creation fails.
     upstream_command: str = ""
+    # Policy name for the single upstream until a server registry exists.
+    upstream_server_id: str = "default"
+    policy_file: str = "policies/example-policy.yaml"
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5
 
