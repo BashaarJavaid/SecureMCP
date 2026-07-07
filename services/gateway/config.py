@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     # Defaults are local-dev only; docker-compose.yml / .env override them.
     database_url: str = "postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp"
     redis_url: str = "redis://localhost:6379/0"
+    # Single upstream MCP server, spawned per session as a stdio subprocess (ROADMAP item 2:
+    # one hardcoded upstream, no server registry). Empty = session creation fails.
+    upstream_command: str = ""
+    session_idle_ttl: int = 300
+    shutdown_grace_seconds: int = 5
 
 
 settings = Settings()
