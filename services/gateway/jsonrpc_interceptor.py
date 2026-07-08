@@ -17,12 +17,12 @@ the upstream on a miss (TTL expiry or a client that calls without listing).
 """
 
 import asyncio
-import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
 from mcp.shared.message import SessionMessage
 from mcp.types import (
     ErrorData,
@@ -37,10 +37,10 @@ from services.gateway import param_validator, schema_pruner
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType
+from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
+from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
 from services.gateway.schema_cache import SchemaCache
-
-logger = logging.getLogger(__name__)
 
 # Implementation-defined JSON-RPC error codes; the canonical Decision object (§4.3)
 # travels in error.data for policy denials.
@@ -82,14 +82,25 @@ def _error(request_id: RequestId, code: int, message: str, data: object = None) 
 @dataclass
 class Interceptor:
     identity_id: str
+    session_id: str
     store: PolicyStore
     writer: AuditWriter
     cache: SchemaCache
+    detector: DriftDetector
+    replay: ReplayGuard
     send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
     # to these ids resolve a future and are never forwarded to the client.
     _internal: dict[str, "asyncio.Future[dict[str, Any]]"] = field(default_factory=dict)
+    _log: structlog.stdlib.BoundLogger = field(init=False)
+
+    def __post_init__(self) -> None:
+        # §7: correlation id = session id. Bound here because interceptor calls run in
+        # the per-session pump task, out of reach of request-scoped contextvars.
+        self._log = structlog.get_logger(__name__).bind(
+            session_id=self.session_id, identity=self.identity_id
+        )
 
     @property
     def engine(self) -> PolicyEngine:
@@ -102,7 +113,7 @@ class Interceptor:
         if not isinstance(root, JSONRPCRequest):
             method = getattr(root, "method", None)
             if method is not None and method not in _HANDLED_METHODS:
-                logger.info("passthrough (no handler): %s", method)
+                self._log.info("passthrough_no_handler", method=method)
             return Forward(message)
         self._pending[root.id] = root.method
         if root.method == "initialize":
@@ -111,7 +122,7 @@ class Interceptor:
         elif root.method == "tools/call":
             return await self._authorize_call(message, root)
         elif root.method not in _HANDLED_METHODS:
-            logger.info("passthrough (no handler): %s", root.method)
+            self._log.info("passthrough_no_handler", method=root.method)
         return Forward(message)
 
     async def _authorize_call(
@@ -119,8 +130,45 @@ class Interceptor:
     ) -> Forward | Respond:
         params = request.params or {}
         tool_name = str(params.get("name", ""))
+
+        # Replay Guard (§4.2 stage 1, cheapest check first): nonce + timestamp from
+        # params._meta; missing/invalid fields and a Redis failure all deny (§5).
+        meta = params.get("_meta") or {}
+        try:
+            replay_reason = await self.replay.check(
+                meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
+            )
+        except Exception:
+            self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
+            replay_reason = "replay guard unavailable"
+        if replay_reason is not None:
+            return await self._deny(
+                request,
+                tool_name,
+                EventType.DENY_REPLAY,
+                f"Replay detected: {replay_reason}",
+                ["replay_guard"],
+            )
+
         if not self.engine.is_allowed(self.identity_id, settings.upstream_server_id, tool_name):
             return await self._deny_rbac(request, tool_name)
+
+        # Schema drift status (§4.2 stage 5): a tool blocked on High/Critical drift is
+        # denied until re-approval; a status lookup failure also denies (§5).
+        try:
+            drift_blocked = await self.detector.is_blocked(settings.upstream_server_id, tool_name)
+        except Exception:
+            self._log.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
+            drift_blocked = True
+        if drift_blocked:
+            return await self._deny(
+                request,
+                tool_name,
+                EventType.DENY_DRIFT,
+                f"{tool_name!r} is blocked: schema drifted from its approved baseline"
+                " and is pending re-approval",
+                ["drift_detector"],
+            )
 
         # Parameter validation (§4.2 stage 7, §4.8): cache miss triggers a transparent
         # upstream re-fetch (§8); only an unfetchable schema fails closed.
@@ -141,18 +189,28 @@ class Interceptor:
         if sanitized_fields:
             payload_extra["sanitized_fields"] = sanitized_fields
         try:
-            await self.writer.write(
+            seq = await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
             )
         except Exception:
-            logger.exception("audit write failed; denying tools/call %r (fail closed)", tool_name)
+            self._log.exception("audit_write_failed_fail_closed", tool=tool_name)
             self._pending.pop(request.id, None)
-            return _error(
-                request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
-            )
+            return _error(request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied")
+        self._log.info(
+            "decision",
+            decision="allow",
+            event_type=EventType.ALLOW.value,
+            tool=tool_name,
+            audit_id=str(seq),
+        )
+        # The nonce/timestamp pair is gateway-facing only — it must not leak upstream.
+        meta.pop(NONCE_META_KEY, None)
+        meta.pop(TIMESTAMP_META_KEY, None)
+        if not meta:
+            params.pop("_meta", None)
         return Forward(message)
 
     async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:
@@ -168,83 +226,87 @@ class Interceptor:
         return None  # RBAC-allowed but the upstream doesn't expose it — fail closed
 
     async def _refetch_tools(self) -> list[dict[str, Any]] | None:
-        """Gateway-initiated tools/list (§8 TTL expiry / cache miss). Phase 2's drift
-        check (item 9) runs here on the re-fetched schema."""
+        """Gateway-initiated tools/list (§8 TTL expiry / cache miss). The re-fetched
+        schema goes through the same drift check as a client-initiated list."""
         request_id = f"securmcp:{uuid.uuid4().hex}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._internal[request_id] = future
         try:
             await self.send_upstream(
-                JSONRPCMessage(
-                    JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/list")
-                )
+                JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/list"))
             )
             result = await asyncio.wait_for(future, timeout=_REFETCH_TIMEOUT_S)
+            tools: list[dict[str, Any]] = result.get("tools", [])
+            await self.detector.check(settings.upstream_server_id, tools, self.identity_id)
+            await self.cache.put(settings.upstream_server_id, tools)
         except Exception:
-            logger.exception("transparent tools/list re-fetch failed")
+            self._log.exception("tools_list_refetch_failed")
             return None
         finally:
             self._internal.pop(request_id, None)
-        tools: list[dict[str, Any]] = result.get("tools", [])
-        await self.cache.put(settings.upstream_server_id, tools)
         return tools
+
+    async def _deny(
+        self,
+        request: JSONRPCRequest,
+        tool_name: str,
+        event_type: EventType,
+        reason: str,
+        matched_rules: list[str],
+    ) -> Respond:
+        """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
+        row seq as audit_id. The deny stands even if the audit write fails."""
+        self._pending.pop(request.id, None)
+        decision = Decision(
+            decision=DecisionOutcome.DENY,
+            event_type=event_type,
+            reason=reason,
+            matched_rules=matched_rules,
+            policy_version=self.engine.version,
+        )
+        try:
+            seq = await self.writer.write(
+                event_type,
+                self.identity_id,
+                tool_name=tool_name,
+                payload_extra={"reason": decision.reason},
+            )
+            decision.audit_id = str(seq)
+        except Exception:
+            self._log.exception("audit_write_failed", event_type=event_type.value, tool=tool_name)
+        self._log.info(
+            "decision",
+            decision="deny",
+            event_type=event_type.value,
+            tool=tool_name,
+            reason=decision.reason,
+            audit_id=decision.audit_id,
+        )
+        return _error(
+            request.id,
+            POLICY_DENIED_CODE,
+            decision.reason,
+            data=decision.model_dump(mode="json"),
+        )
 
     async def _deny_validation(
         self, request: JSONRPCRequest, tool_name: str, reason: str
     ) -> Respond:
-        self._pending.pop(request.id, None)
-        decision = Decision(
-            decision=DecisionOutcome.DENY,
-            event_type=EventType.DENY_VALIDATION,
-            reason=f"invalid arguments for {tool_name!r}: {reason}",
-            matched_rules=["param_validator"],
-            policy_version=self.engine.version,
-        )
-        logger.info("DENY_VALIDATION: %s", decision.reason)
-        try:
-            seq = await self.writer.write(
-                EventType.DENY_VALIDATION,
-                self.identity_id,
-                tool_name=tool_name,
-                payload_extra={"reason": decision.reason},
-            )
-            decision.audit_id = str(seq)
-        except Exception:
-            # The deny still stands; only the record of it failed. Log loudly.
-            logger.exception("audit write failed for DENY_VALIDATION on %r", tool_name)
-        return _error(
-            request.id,
-            POLICY_DENIED_CODE,
-            decision.reason,
-            data=decision.model_dump(mode="json"),
+        return await self._deny(
+            request,
+            tool_name,
+            EventType.DENY_VALIDATION,
+            f"invalid arguments for {tool_name!r}: {reason}",
+            ["param_validator"],
         )
 
     async def _deny_rbac(self, request: JSONRPCRequest, tool_name: str) -> Respond:
-        self._pending.pop(request.id, None)
-        decision = Decision(
-            decision=DecisionOutcome.DENY,
-            event_type=EventType.DENY_RBAC,
-            reason=f"identity {self.identity_id!r} is not authorized to call {tool_name!r}",
-            matched_rules=[f"policy-v{self.engine.version}:rbac"],
-            policy_version=self.engine.version,
-        )
-        logger.info("DENY_RBAC: %s", decision.reason)
-        try:
-            seq = await self.writer.write(
-                EventType.DENY_RBAC,
-                self.identity_id,
-                tool_name=tool_name,
-                payload_extra={"reason": decision.reason},
-            )
-            decision.audit_id = str(seq)
-        except Exception:
-            # The deny still stands; only the record of it failed. Log loudly.
-            logger.exception("audit write failed for DENY_RBAC on %r", tool_name)
-        return _error(
-            request.id,
-            POLICY_DENIED_CODE,
-            decision.reason,
-            data=decision.model_dump(mode="json"),
+        return await self._deny(
+            request,
+            tool_name,
+            EventType.DENY_RBAC,
+            f"identity {self.identity_id!r} is not authorized to call {tool_name!r}",
+            [f"policy-v{self.engine.version}:rbac"],
         )
 
     async def on_upstream_message(self, message: SessionMessage) -> SessionMessage | None:
@@ -273,6 +335,13 @@ class Interceptor:
         self, message: SessionMessage, response: JSONRPCResponse
     ) -> SessionMessage:
         full = response.result.get("tools", [])
+        try:
+            await self.detector.check(settings.upstream_server_id, full, self.identity_id)
+        except Exception:
+            self._log.exception("drift_check_failed_fail_closed")
+            return _error(
+                response.id, AUDIT_UNAVAILABLE_CODE, "drift check unavailable; tools/list denied"
+            ).message
         schema_hash = await self.cache.put(settings.upstream_server_id, full)
         served = schema_pruner.prune(
             full, self.identity_id, settings.upstream_server_id, self.engine
@@ -290,7 +359,9 @@ class Interceptor:
                 payload_extra={"served_tools": served_names, "pruned_tools": pruned_names},
             )
         except Exception:
-            logger.exception("audit write failed; withholding tools/list (fail closed)")
+            self._log.exception(
+                "audit_write_failed_fail_closed", event_type=EventType.TOOLS_LIST.value
+            )
             return _error(
                 response.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; tools/list denied"
             ).message

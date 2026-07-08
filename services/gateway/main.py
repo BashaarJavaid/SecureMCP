@@ -1,27 +1,30 @@
 """FastAPI app entrypoint."""
 
 import asyncio
-import logging
 import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI
+import structlog
+from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth
+from services.gateway import auth, logging_config, signing
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import async_session
-from services.gateway.decision import EventType
+from services.gateway.decision import Decision, DecisionOutcome, EventType
+from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyStore
+from services.gateway.replay_guard import ReplayGuard
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
-logger = logging.getLogger(__name__)
+logging_config.configure()
+logger = structlog.get_logger(__name__)
 
 KEY_HEADER = "x-securmcp-key"
 
@@ -41,24 +44,33 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
             },
         )
     except Exception:
-        logger.exception("audit write failed for POLICY_ACTIVATED")
+        logger.exception("audit_write_failed", event_type="POLICY_ACTIVATED")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5).
+    # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
+    # so must a missing/unreadable audit signing key (§4.8, item 11).
     store = PolicyStore(settings.policy_file)
     app.state.policy_store = store
+    signing_key = signing.load_private_key(settings.signing_key_file)
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    writer = AuditWriter(redis_client, async_session, store)
-    manager = SessionManager(redis_client, store, writer, SchemaCache(redis_client))
+    writer = AuditWriter(redis_client, async_session, store, signing_key)
+    detector = DriftDetector(async_session, writer)
+    app.state.drift_detector = detector
+    manager = SessionManager(
+        redis_client,
+        store,
+        writer,
+        SchemaCache(redis_client),
+        detector,
+        ReplayGuard(redis_client, settings.replay_window_seconds),
+    )
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
     # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(
-        signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer))
-    )
+    loop.add_signal_handler(signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer)))
     try:
         yield
     finally:
@@ -76,6 +88,32 @@ app = FastAPI(title="SecurMCP Gateway", lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/admin/tools/{server_id}/{tool_name}/approve")
+async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict[str, object]:
+    """Drift re-approval (§4.8): snapshot the observed schema as the accepted baseline.
+    Audited, authenticated admin action — requires a key resolving to an admin identity."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = auth.resolve_identity(request.headers.get(KEY_HEADER), store.engine)
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    detector: DriftDetector = request.app.state.drift_detector
+    try:
+        seq = await detector.approve(server_id, tool_name, approved_by=identity_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.APPROVED,
+        reason=f"schema for {tool_name!r} on {server_id!r} re-approved by {identity_id!r}",
+        matched_rules=["admin_approval"],
+        policy_version=store.engine.version,
+        audit_id=str(seq),
+    )
+    return decision.model_dump(mode="json")
 
 
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
@@ -110,10 +148,8 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         try:
             session = await manager.create(identity_id)
         except Exception:
-            logger.exception("session creation failed")
-            await Response("session could not be created", status_code=503)(
-                scope, receive, send
-            )
+            logger.exception("session_creation_failed", identity=identity_id)
+            await Response("session could not be created", status_code=503)(scope, receive, send)
             return
     else:
         await Response("missing mcp-session-id header", status_code=400)(scope, receive, send)

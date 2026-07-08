@@ -7,13 +7,13 @@ fails startup — fail closed (ARCHITECTURE.md §5).
 """
 
 import hashlib
-import logging
 from pathlib import Path
 
+import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class ServerGrant(BaseModel):
@@ -29,6 +29,8 @@ class Identity(BaseModel):
 
     id: str
     api_key_hash: str
+    # Grants access to /admin endpoints (drift re-approval, and Phase 3's admin API).
+    admin: bool = False
     allowed_servers: list[ServerGrant] = []
 
 
@@ -52,6 +54,10 @@ class PolicyEngine:
 
     def identity_for_key_hash(self, key_hash: str) -> str | None:
         return self._by_key_hash.get(key_hash)
+
+    def is_admin(self, identity_id: str) -> bool:
+        identity = self._identities.get(identity_id)
+        return identity is not None and identity.admin
 
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:
         """RBAC resolution: unknown/missing identity denies; a grant matches by exact
@@ -94,7 +100,7 @@ class PolicyStore:
         try:
             self.engine = load(self._path)
         except Exception:
-            logger.exception("policy reload failed; keeping last-known-good policy")
+            logger.exception("policy_reload_failed_keeping_last_known_good")
             return False
-        logger.info("policy reloaded: version %d", self.engine.version)
+        logger.info("policy_reloaded", version=self.engine.version)
         return True

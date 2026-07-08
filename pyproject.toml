@@ -13,15 +13,18 @@ dependencies = [
     "asyncpg==0.30.0",
     "alembic==1.14.0",
     "canonicaljson==2.0.0",
+    "cryptography==49.0.0",
     "redis==5.2.1",
     "pydantic-settings==2.7.0",
     "pyyaml==6.0.2",
+    "structlog==26.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==8.3.4",
     "pytest-asyncio==0.25.0",
+    "pytest-cov==6.0.0",
     "httpx==0.28.1",
     "ruff==0.8.4",
     "mypy==1.14.0",

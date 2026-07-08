@@ -1,0 +1,122 @@
+# CI per ARCHITECTURE.md §12: lint, typecheck, test + coverage gate, docker build
+# on every push/PR; benchmark-on-merge (main only, §9) uploads the latency report
+# as an artifact. Image push happens in release.yml on tag, not here.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: mypy services/
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: securmcp
+          POSTGRES_PASSWORD: securmcp
+          POSTGRES_DB: securmcp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U securmcp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Service containers are up, so the integration/adversarial suites run
+      # for real here — the reachability skip in clean_audit must not fire.
+      - run: pytest --cov=services --cov-fail-under=80
+
+  benchmark:
+    # §9: on merge to main only, never per-PR, to keep PR CI fast.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: securmcp
+          POSTGRES_PASSWORD: securmcp
+          POSTGRES_DB: securmcp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U securmcp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # N=100 (vs the local default 1000) keeps the job practical on a shared
+      # runner; the fixed 10/50/100-session concurrency scenarios are unaffected.
+      # Runner numbers track regressions between runs, they don't replace the
+      # measured numbers in the README's Performance section.
+      - run: python -m tests.benchmarks.run 100
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: tests/benchmarks/reports/
+          retention-days: 30
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build .

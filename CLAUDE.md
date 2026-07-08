@@ -30,18 +30,23 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Commands
 
-- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379). Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
+- `python scripts/generate_signing_key.py` — one-time: mint the audit-log ECDSA keypair into gitignored `secrets/`; the gateway fails startup without it.
+- `docker compose up -d` — full stack: gateway (port 8000), Postgres 16 (5432), Redis 7 (6379), audit verifier sidecar. Copy `.env.example` to `.env` first (optional; compose has matching dev defaults).
 - `docker compose run --rm gateway alembic upgrade head` — run migrations in-container; from the host use `DATABASE_URL=postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp .venv/bin/alembic upgrade head`.
 - Local dev setup: `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
 - `.venv/bin/pytest` — tests
 - `.venv/bin/ruff check .` — lint
+- `.venv/bin/ruff format --check .` — formatting (CI-enforced; fix with `ruff format .`)
 - `.venv/bin/mypy services/` — strict type-check
-- `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain
-- `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build` — the schema-pruning demo
+- `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain (+ signatures when the public key is present)
+- `.venv/bin/python scripts/audit_verifier_daemon.py [--once]` — incremental checkpointed verification (the compose `verifier` sidecar runs this on a loop)
+- `.venv/bin/python -m tests.benchmarks.run [N]` — performance benchmark suite (default N=1000 calls/scenario); needs postgres + redis up (`docker compose up -d postgres redis`) and wipes the dev audit chain like the integration tests do; reports land in gitignored `tests/benchmarks/reports/`
+- `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" docker compose up -d --build`, then `curl -X POST localhost:9800/_admin/apply_mutation` when prompted — the pruning + drift-blocking demo (resets the dev audit chain/baselines at start)
+- CI (`.github/workflows/ci.yml`): lint + format check + mypy + `pytest --cov=services --cov-fail-under=80` + docker build on every push/PR; benchmarks (N=100, report artifact) on pushes to `main` only; `release.yml` pushes `ghcr.io/<owner>/securmcp` on `v*` tags.
 
 ## Current phase
 
-See `ROADMAP.md`. **Phase 1 is complete** (items 1–8: scaffold/migrations; Session Manager + Interceptor over Streamable HTTP; RBAC Policy Engine + Schema Pruner; API-key auth; hash-chained audit log + basic verifier; Parameter Validator; cache invalidation with SIGHUP hot-reload; overscoped demo server + verified demo driver). Phase 2 starts with item 9 (Drift Detector with severity classification) — its hook point is the schema re-fetch in `jsonrpc_interceptor.py`.
+See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15). Phase 3 is next, starting with item 16: Risk Engine v1 — factor-list scoring (tool sensitivity, blast radius, business hours, call frequency, drift-in-review) plus the risk decay feedback loop (per-identity/tool calibration counter on approval, behavioral factors only, never the static sensitivity tier).
 
 ---
 

@@ -3,6 +3,7 @@ the basic verifier validates the chain, tampering is caught, concurrent writes d
 collide, and an unrecordable action is denied (§5)."""
 
 import asyncio
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -10,9 +11,11 @@ from typing import Any, cast
 
 import pytest
 import redis.asyncio as aioredis
+from cryptography.hazmat.primitives.asymmetric import ec
 from mcp import McpError
 from sqlalchemy import select, text
 
+from services.gateway import signing
 from services.gateway.audit_log import GENESIS_HASH, AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
@@ -37,8 +40,13 @@ async def fetch_rows() -> list[AuditLog]:
 
 
 def run_verifier() -> "subprocess.CompletedProcess[str]":
+    # Point the subprocess at the per-run public key, not any local secrets/ key.
+    env = dict(os.environ, SIGNING_PUBLIC_KEY_FILE=settings.signing_public_key_file)
     return subprocess.run(
-        [sys.executable, "scripts/verify_audit_chain.py"], capture_output=True, text=True
+        [sys.executable, "scripts/verify_audit_chain.py"],
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
 
@@ -57,6 +65,10 @@ async def test_decision_points_write_chained_rows(gateway: Gateway) -> None:
     assert rows[0].prev_hash == GENESIS_HASH
     for prev, row in zip(rows, rows[1:], strict=False):
         assert row.prev_hash == prev.curr_hash
+
+    # Every row is ECDSA-signed by the gateway's key (item 11).
+    public_key = signing.load_public_key(settings.signing_public_key_file)
+    assert all(signing.verify(public_key, r.signature, r.curr_hash) for r in rows)
 
 
 async def test_deny_error_carries_audit_id(gateway: Gateway) -> None:
@@ -92,7 +104,10 @@ async def test_verifier_passes_then_catches_tampering(gateway: Gateway) -> None:
 async def test_concurrent_writes_do_not_collide(clean_audit: None) -> None:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     writer = AuditWriter(
-        redis_client, async_session, cast(Any, SimpleNamespace(engine=SimpleNamespace(version=1)))
+        redis_client,
+        async_session,
+        cast(Any, SimpleNamespace(engine=SimpleNamespace(version=1))),
+        ec.generate_private_key(ec.SECP256R1()),
     )
     try:
         seqs = await asyncio.gather(

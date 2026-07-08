@@ -1,9 +1,11 @@
-"""Hash-chain audit writer (ARCHITECTURE.md §4.8). ECDSA signing comes in Phase 2.
+"""Hash-chain audit writer (ARCHITECTURE.md §4.8).
 
 Chain: H_t = SHA256(H_(t-1) || canonical_json(payload_t)). The payload is
 self-contained — identity, server, tool, event type and policy version live *inside*
 it — because the hash covers only the payload; the bare columns on audit_log are
 queryable projections, and tampering them is caught via their hash-protected copies.
+Every row's curr_hash is additionally ECDSA-signed (item 11) so a regenerated chain
+is detectable without the private key.
 
 The latest chain hash is cached in Redis (`latest_audit_hash`) so the hot path never
 does a Postgres read; the Postgres insert itself stays synchronous and awaited —
@@ -13,21 +15,23 @@ caller must deny.
 
 import asyncio
 import hashlib
-import logging
 from typing import Any
 
 import canonicaljson
 import redis.asyncio as aioredis
+import structlog
+from cryptography.hazmat.primitives.asymmetric import ec
 from redis.exceptions import WatchError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from services.gateway import signing
 from services.gateway.config import settings
 from services.gateway.db import AuditLog
 from services.gateway.decision import EventType
 from services.gateway.policy_engine import PolicyStore
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 GENESIS_HASH = "0" * 64
 POINTER_KEY = "latest_audit_hash"
@@ -45,10 +49,12 @@ class AuditWriter:
         redis_client: aioredis.Redis,
         sessionmaker: async_sessionmaker[AsyncSession],
         policy_store: PolicyStore,
+        signing_key: ec.EllipticCurvePrivateKey,
     ) -> None:
         self._redis = redis_client
         self._sessions = sessionmaker
         self._policy_store = policy_store
+        self._signing_key = signing_key
         # Serializes chain writes so seq order matches chain order. Sufficient for the
         # single-instance Phase 1 deployment; multi-replica write ordering is the
         # documented §10 concern, deferred with the rest of the scaling story.
@@ -123,6 +129,7 @@ class AuditWriter:
             row = AuditLog(
                 prev_hash=prev_hash,
                 curr_hash=curr_hash,
+                signature=signing.sign(self._signing_key, curr_hash),
                 identity_id=identity_id,
                 server_id=settings.upstream_server_id,
                 tool_name=tool_name,

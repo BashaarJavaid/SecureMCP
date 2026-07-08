@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+import uuid
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -7,9 +9,15 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
+from services.gateway import logging_config
 from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
+from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
+
+# Route structlog through stdlib so caplog sees the records (main.py does this in
+# production; unit tests never import main).
+logging_config.configure()
 
 POLICY = PolicyFile.model_validate(
     {
@@ -49,6 +57,31 @@ class FakeWriter:
         return 42
 
 
+class FakeDetector:
+    def __init__(self) -> None:
+        self.blocked: set[str] = set()
+        self.checked: list[list[dict[str, Any]]] = []
+
+    async def check(self, server_id: str, tools: list[dict[str, Any]], identity_id: str) -> None:
+        self.checked.append(tools)
+
+    async def is_blocked(self, server_id: str, tool_name: str) -> bool:
+        return tool_name in self.blocked
+
+
+class FakeReplay:
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+
+    async def check(self, nonce: object, timestamp: object) -> str | None:
+        if not isinstance(nonce, str) or not isinstance(timestamp, int | float):
+            return "missing or invalid nonce or timestamp"
+        if nonce in self.seen:
+            return "nonce already seen within the timestamp window"
+        self.seen.add(nonce)
+        return None
+
+
 class FakeCache:
     def __init__(self) -> None:
         self.data: dict[str, list[dict[str, Any]]] = {}
@@ -72,22 +105,32 @@ async def _no_upstream(message: JSONRPCMessage) -> None:
 
 def make_interceptor(
     identity: str = "agent-readonly", with_schema: bool = True
-) -> tuple[Interceptor, FakeWriter, FakeCache]:
+) -> tuple[Interceptor, FakeWriter, FakeCache, FakeDetector]:
     writer = FakeWriter()
     cache = FakeCache()
+    detector = FakeDetector()
     if with_schema:
         cache.data["default"] = [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
     interceptor = Interceptor(
         identity_id=identity,
+        session_id="test-session",
         store=cast(Any, SimpleNamespace(engine=PolicyEngine(POLICY))),
         writer=cast(Any, writer),
         cache=cast(Any, cache),
+        detector=cast(Any, detector),
+        replay=cast(Any, FakeReplay()),
         send_upstream=_no_upstream,
     )
-    return interceptor, writer, cache
+    return interceptor, writer, cache, detector
+
+
+def fresh_meta() -> dict[str, Any]:
+    return {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: time.time()}
 
 
 def request(method: str, params: dict | None = None, id: int = 1) -> SessionMessage:  # noqa: A002
+    if method == "tools/call" and params is not None and "_meta" not in params:
+        params = {**params, "_meta": fresh_meta()}
     return SessionMessage(
         JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=id, method=method, params=params))
     )
@@ -97,7 +140,7 @@ async def test_unhandled_method_passes_through_unmodified_but_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     message = request("weird/unknown", {"x": 1})
-    interceptor, _, _ = make_interceptor()
+    interceptor, _, _, _ = make_interceptor()
     with caplog.at_level(logging.INFO, logger="services.gateway.jsonrpc_interceptor"):
         outcome = await interceptor.on_client_message(message)
 
@@ -106,8 +149,40 @@ async def test_unhandled_method_passes_through_unmodified_but_logged(
     assert "weird/unknown" in caplog.text
 
 
+async def test_decision_log_lines_are_structured_with_session_correlation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """§7: one line per decision, correlation id = session id — allow and deny alike."""
+    interceptor, _, _, _ = make_interceptor()
+    with caplog.at_level(logging.INFO, logger="services.gateway.jsonrpc_interceptor"):
+        allowed = await interceptor.on_client_message(
+            request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+        )
+        denied = await interceptor.on_client_message(
+            request("tools/call", {"name": "forbidden", "arguments": {}}, id=2)
+        )
+    assert isinstance(allowed, Forward)
+    assert isinstance(denied, Respond)
+
+    decisions = [
+        record.msg
+        for record in caplog.records
+        if isinstance(record.msg, dict) and record.msg.get("event") == "decision"
+    ]
+    assert [d["decision"] for d in decisions] == ["allow", "deny"]
+    allow_line, deny_line = decisions
+    assert allow_line["event_type"] == "ALLOW"
+    assert allow_line["tool"] == "echo"
+    assert deny_line["event_type"] == "DENY_RBAC"
+    assert deny_line["tool"] == "forbidden"
+    assert deny_line["audit_id"] == "42"  # FakeWriter's seq
+    for line in decisions:
+        assert line["session_id"] == "test-session"
+        assert line["identity"] == "agent-readonly"
+
+
 async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
-    interceptor, writer, _ = make_interceptor()
+    interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "delete_repo", "arguments": {}})
     )
@@ -123,7 +198,7 @@ async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> No
 
 
 async def test_authorized_tools_call_is_audited_then_forwarded() -> None:
-    interceptor, writer, _ = make_interceptor()
+    interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
     )
@@ -132,7 +207,7 @@ async def test_authorized_tools_call_is_audited_then_forwarded() -> None:
 
 
 async def test_allow_that_cannot_be_recorded_is_denied() -> None:
-    interceptor, writer, _ = make_interceptor()
+    interceptor, writer, _, _ = make_interceptor()
 
     async def broken_write(*args: Any, **kwargs: Any) -> int:
         raise ConnectionError("postgres down")
@@ -144,15 +219,42 @@ async def test_allow_that_cannot_be_recorded_is_denied() -> None:
     assert isinstance(outcome, Respond)  # no record, no action (§5)
 
 
+async def test_drift_blocked_tool_is_denied() -> None:
+    interceptor, writer, _, detector = make_interceptor()
+    detector.blocked.add("echo")
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    error = outcome.message.message.root
+    assert error.error.data["event_type"] == "DENY_DRIFT"
+    assert error.error.data["audit_id"] == "42"
+    assert writer.events == [EventType.DENY_DRIFT]
+
+
+async def test_drift_status_lookup_failure_denies() -> None:
+    interceptor, _, _, detector = make_interceptor()
+
+    async def broken(server_id: str, tool_name: str) -> bool:
+        raise ConnectionError("postgres down")
+
+    detector.is_blocked = broken  # type: ignore[method-assign]
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_DRIFT"
+
+
 async def test_initialize_invalidates_schema_cache() -> None:
-    interceptor, _, cache = make_interceptor()
+    interceptor, _, cache, _ = make_interceptor()
     outcome = await interceptor.on_client_message(request("initialize", {}))
     assert isinstance(outcome, Forward)
     assert cache.invalidated == ["default"]
 
 
 async def test_cache_miss_triggers_transparent_refetch_then_forwards() -> None:
-    interceptor, writer, cache = make_interceptor(with_schema=False)
+    interceptor, writer, cache, _ = make_interceptor(with_schema=False)
     sent: list[JSONRPCMessage] = []
 
     async def capture(message: JSONRPCMessage) -> None:
@@ -189,7 +291,7 @@ async def test_cache_miss_triggers_transparent_refetch_then_forwards() -> None:
 
 
 async def test_failed_refetch_is_denied_validation() -> None:
-    interceptor, writer, _ = make_interceptor(with_schema=False)
+    interceptor, writer, _, _ = make_interceptor(with_schema=False)
     # send_upstream raises (default _no_upstream would too, but be explicit)
 
     async def broken(message: JSONRPCMessage) -> None:
@@ -205,7 +307,7 @@ async def test_failed_refetch_is_denied_validation() -> None:
 
 
 async def test_invalid_arguments_are_denied_and_audited() -> None:
-    interceptor, writer, _ = make_interceptor()
+    interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
         request("tools/call", {"name": "echo", "arguments": {"text": "hi", "bogus": 1}})
     )
@@ -218,7 +320,7 @@ async def test_invalid_arguments_are_denied_and_audited() -> None:
 
 
 async def test_forwarded_arguments_are_sanitized() -> None:
-    interceptor, _, _ = make_interceptor()
+    interceptor, _, _, _ = make_interceptor()
     message = request("tools/call", {"name": "echo", "arguments": {"text": "../a\x00b"}})
     outcome = await interceptor.on_client_message(message)
     assert isinstance(outcome, Forward)
@@ -226,7 +328,7 @@ async def test_forwarded_arguments_are_sanitized() -> None:
 
 
 async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
-    interceptor, writer, cache = make_interceptor(with_schema=False)
+    interceptor, writer, cache, detector = make_interceptor(with_schema=False)
     await interceptor.on_client_message(request("tools/list", id=7))
     response = SessionMessage(
         JSONRPCMessage(
@@ -245,3 +347,74 @@ async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
     assert out.message.root.result["_meta"] == {"etag": f"1-{FAKE_HASH}"}
     assert cache.data["default"] == [{"name": "echo"}, {"name": "delete_repo"}]
     assert writer.events == [EventType.TOOLS_LIST]
+    assert detector.checked == [[{"name": "echo"}, {"name": "delete_repo"}]]  # full list
+
+
+async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
+    interceptor, writer, _, _ = make_interceptor()
+    meta = fresh_meta()
+    first = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": dict(meta)})
+    )
+    assert isinstance(first, Forward)
+
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": dict(meta)})
+    )
+    assert isinstance(outcome, Respond)
+    error = outcome.message.message.root
+    assert error.error.data["event_type"] == "DENY_REPLAY"
+    assert error.error.data["decision"] == "deny"
+    assert error.error.data["matched_rules"] == ["replay_guard"]
+    assert error.error.data["audit_id"] == "42"
+    assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
+
+
+async def test_missing_nonce_is_denied_before_rbac() -> None:
+    # Replay is pipeline stage 1 (§4.2): even an RBAC-denied tool reports DENY_REPLAY.
+    interceptor, writer, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "delete_repo", "arguments": {}, "_meta": {}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+    assert writer.events == [EventType.DENY_REPLAY]
+
+
+async def test_replay_check_failure_denies() -> None:
+    interceptor, _, _, _ = make_interceptor()
+
+    async def broken(nonce: object, timestamp: object) -> str | None:
+        raise ConnectionError("redis down")
+
+    interceptor.replay.check = broken  # type: ignore[method-assign]
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+
+
+async def test_forwarded_call_has_replay_meta_stripped() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Forward)
+    assert "_meta" not in outcome.message.message.root.params
+
+
+async def test_other_meta_content_survives_the_strip() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "hi"},
+                "_meta": {**fresh_meta(), "progressToken": "tok-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Forward)
+    assert outcome.message.message.root.params["_meta"] == {"progressToken": "tok-1"}
