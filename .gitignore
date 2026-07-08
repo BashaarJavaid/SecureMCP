@@ -10,3 +10,4 @@ dist/
 policies/demo-policy.yaml
 secrets/
 tests/benchmarks/reports/
+.rogue-state/

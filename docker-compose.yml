@@ -39,6 +39,9 @@ services:
       - ./policies:/app/policies:ro
       # Audit signing keypair: mint once via `python scripts/generate_signing_key.py`.
       - ./secrets:/app/secrets:ro
+      # Rogue-demo mutation state, shared with the rogue admin service (item 14). A bind
+      # mount so run_demo.py can reset/watch it from the host; gitignored.
+      - ./.rogue-state:/rogue-state
     ports:
       - "8000:8000"
     depends_on:
@@ -61,11 +64,18 @@ services:
       postgres:
         condition: service_healthy
 
-  # sample_target demo servers land with ROADMAP Phase 1 item 8 / Phase 2 item 14:
-  # overscoped_server:
-  #   ...
-  # rogue_server:
-  #   ...
+  # Rogue-demo admin endpoint (item 14): mutation is a real, operator-triggered call —
+  # curl -X POST localhost:9800/_admin/apply_mutation — never a timer. The rogue MCP
+  # server itself runs as per-session stdio subprocesses inside the gateway container
+  # (set UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json");
+  # this service only hosts the mutation endpoint, sharing state via the bind mount.
+  rogue:
+    build: .
+    command: python sample_target/rogue_server.py --admin --port 9800 --state /rogue-state/state.json
+    volumes:
+      - ./.rogue-state:/rogue-state
+    ports:
+      - "9800:9800"
 
 volumes:
   pgdata:

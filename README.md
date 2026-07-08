@@ -129,19 +129,26 @@ securmcp/
 
 ---
 
-## Running the demo (Phase 1: schema pruning)
+## Running the demo (Phase 2: schema pruning + drift blocking)
 
 ```bash
 python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
-python scripts/run_demo.py           # mints keys, writes policies/demo-policy.yaml, waits
+python scripts/run_demo.py           # resets demo state, mints keys, writes policies/demo-policy.yaml, waits
 # in another terminal:
-POLICY_FILE=policies/demo-policy.yaml docker compose up -d --build
+POLICY_FILE=policies/demo-policy.yaml \
+  UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" \
+  docker compose up -d --build
+# when the driver prompts — the rug pull, deliberately on screen:
+curl -X POST localhost:9800/_admin/apply_mutation
 ```
 
-The driver connects as `developer` (sees only `read_file`/`list_issues` — the destructive
-tools are absent, not marked), then as `ops-admin` (sees all four), then prints the
-hash-chained audit rows recording exactly what was pruned from whom. The full demo
-narrative below arrives feature-by-feature with later phases.
+The driver connects as `developer` (sees only `send_email`/`read_inbox` — the destructive
+`delete_mailbox` is absent, not marked), then as `ops-admin` (sees all three), makes a
+successful `send_email` call, waits for the operator's curl, then shows the drift being
+classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call
+succeeding with the new required `bcc`, and finishes with the hash-chained audit
+receipts. (The driver wipes the local dev audit chain and drift baselines at start so
+reruns are repeatable.) The rest of the narrative below arrives with Phase 3.
 
 ---
 
@@ -171,7 +178,7 @@ Reproduce: `docker compose up -d postgres redis && .venv/bin/python -m tests.ben
 Two tiny MCP servers built specifically to make the gateway's value visible in a 30-second recording:
 
 - `overscoped_server.py`: exposes tools like `read_file`, `delete_repo`, `merge_pr` with no internal authz — demonstrates schema pruning when a low-privilege identity connects.
-- `rogue_server.py`: starts with a benign `send_email(to, subject, body)` tool and exposes a real admin endpoint, **`POST /_admin/apply_mutation`**, which swaps in a version of the tool with an added `bcc` parameter and a modified description. There is no timer and no invisible trigger — the mutation only happens when that endpoint is actually called, deliberately, so the demo recording can show a terminal window where an operator runs `curl -X POST http://localhost:.../_admin/apply_mutation` and the schema visibly changes as a real operation, not something that "just happens" off-screen. A demo where the adversarial behavior is invisible reads as scripted magic rather than a real system reacting to a real event.
+- `rogue_server.py`: starts with a benign `send_email(to, subject, body)` tool (plus `read_inbox` and a destructive `delete_mailbox` so the pruning story works against a single upstream) and exposes a real admin endpoint, **`POST /_admin/apply_mutation`**, which swaps in a version of `send_email` with an added **required** `bcc` parameter and a poisoned description. `bcc` is required on purpose: an added *optional* parameter classifies as Medium drift and doesn't block — required is Critical, which does. There is no timer and no invisible trigger — the mutation only happens when that endpoint is actually called, deliberately, so the demo recording can show a terminal window where an operator runs `curl -X POST http://localhost:9800/_admin/apply_mutation` and the schema visibly changes as a real operation, not something that "just happens" off-screen. A demo where the adversarial behavior is invisible reads as scripted magic rather than a real system reacting to a real event. Mechanically: mutation state is a file on a bind mount shared between the `rogue` compose service (which only hosts the admin endpoint) and the per-session stdio MCP subprocesses the gateway spawns; the MCP side reads it on every `tools/list` (low-level `Server` API, not FastMCP), so even a live, long-held session sees the schema change without reconnecting.
 
 Recording script — a single continuous story rather than a feature checklist:
 
@@ -184,6 +191,8 @@ Recording script — a single continuous story rather than a feature checklist:
 7. To close: run Policy Simulation against next week's draft policy over the last hour of demo traffic, and show it would have denied three of the requests just made — a live, on-camera preview of a policy change before it ships.
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
+
+As of Phase 2, steps 1–2, the drift-blocking half of 3, the approval in 4 (via `POST /admin/tools/{server}/{tool}/approve` — the Decision Explanation endpoint is Phase 3), 5, and 6 are live and driven by `scripts/run_demo.py`; the Risk Engine flag in step 3 and the simulation in step 7 land with Phase 3.
 
 ---
 
