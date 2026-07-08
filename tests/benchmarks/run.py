@@ -243,9 +243,7 @@ def max_rss_mib() -> float:
 
 def render(report: dict) -> str:
     single, conc, payload = report["single_call"], report["concurrent"], report["payload_size"]
-    overhead = {
-        k: single["gateway_cached"][k] - single["direct"][k] for k in single["direct"]
-    }
+    overhead = {k: single["gateway_cached"][k] - single["direct"][k] for k in single["direct"]}
     lines = [
         "# SecurMCP benchmark report",
         "",
@@ -264,9 +262,7 @@ def render(report: dict) -> str:
         f"| {fmt_dist(single['gateway_cold'])} | — |",
     ]
     for level in CONCURRENCY_LEVELS:
-        lines.append(
-            f"| {level} concurrent sessions (p95) | — | {conc[level]['p95']:.2f} ms | — |"
-        )
+        lines.append(f"| {level} concurrent sessions (p95) | — | {conc[level]['p95']:.2f} ms | — |")
     lines += [
         f"| tools/list payload size | {payload['direct_bytes']:.0f} B (unpruned) "
         f"| {payload['pruned_bytes']:.0f} B (pruned developer) "

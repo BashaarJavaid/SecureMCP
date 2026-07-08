@@ -35,9 +35,7 @@ async def forge_chain_from(seq: int) -> None:
     async with async_session() as db:
         rows = list(
             (
-                await db.execute(
-                    select(AuditLog).where(AuditLog.seq >= seq).order_by(AuditLog.seq)
-                )
+                await db.execute(select(AuditLog).where(AuditLog.seq >= seq).order_by(AuditLog.seq))
             ).scalars()
         )
         rows[0].payload = {**rows[0].payload, "tool_name": "evil"}

@@ -35,9 +35,7 @@ def sign(private_key: ec.EllipticCurvePrivateKey, curr_hash: str) -> bytes:
     return private_key.sign(curr_hash.encode(), ec.ECDSA(hashes.SHA256()))
 
 
-def verify(
-    public_key: ec.EllipticCurvePublicKey, signature: bytes, curr_hash: str
-) -> bool:
+def verify(public_key: ec.EllipticCurvePublicKey, signature: bytes, curr_hash: str) -> bool:
     try:
         public_key.verify(signature, curr_hash.encode(), ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:

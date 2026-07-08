@@ -31,9 +31,7 @@ async def test_identical_nonce_and_timestamp_is_deny_replay(gateway: Gateway) ->
         assert data["audit_id"] is not None
 
     async with async_session() as db:
-        events = (
-            await db.execute(select(AuditLog.event_type).order_by(AuditLog.seq))
-        ).scalars()
+        events = (await db.execute(select(AuditLog.event_type).order_by(AuditLog.seq))).scalars()
         assert "DENY_REPLAY" in list(events)
 
 

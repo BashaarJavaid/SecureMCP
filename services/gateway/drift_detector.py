@@ -78,9 +78,7 @@ def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
 
     for prop in new_props.keys() - old_props.keys():
         # A new *required* parameter changes what a valid call even looks like.
-        severities.append(
-            DriftSeverity.CRITICAL if prop in new_required else DriftSeverity.MEDIUM
-        )
+        severities.append(DriftSeverity.CRITICAL if prop in new_required else DriftSeverity.MEDIUM)
     if old_props.keys() - new_props.keys():
         severities.append(DriftSeverity.HIGH)
     for prop in old_props.keys() & new_props.keys():
@@ -100,15 +98,11 @@ def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
 
 
 class DriftDetector:
-    def __init__(
-        self, sessionmaker: async_sessionmaker[AsyncSession], writer: AuditWriter
-    ) -> None:
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], writer: AuditWriter) -> None:
         self._sessions = sessionmaker
         self._writer = writer
 
-    async def check(
-        self, server_id: str, tools: list[dict[str, Any]], identity_id: str
-    ) -> None:
+    async def check(self, server_id: str, tools: list[dict[str, Any]], identity_id: str) -> None:
         """Run drift detection over a freshly observed tools list. Raises on storage
         failure — callers withhold the list (fail closed, §5)."""
         live = {str(tool.get("name")): tool for tool in tools}
@@ -189,8 +183,7 @@ class DriftDetector:
             (
                 row
                 for row in baselines.values()
-                if row.tool_name not in live
-                and shape_hash(row.approved_schema) == shape_hash(tool)
+                if row.tool_name not in live and shape_hash(row.approved_schema) == shape_hash(tool)
             ),
             None,
         )

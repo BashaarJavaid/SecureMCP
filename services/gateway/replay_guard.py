@@ -43,9 +43,7 @@ class ReplayGuard:
             return f"timestamp outside the ±{self._window}s window"
         # The setting is the half-width: a nonce with timestamp t stays acceptable
         # until t + window, so first-seen + 2×window strictly outlives its validity.
-        fresh = await self._redis.set(
-            _nonce_key(nonce), 1, nx=True, ex=2 * self._window
-        )
+        fresh = await self._redis.set(_nonce_key(nonce), 1, nx=True, ex=2 * self._window)
         if not fresh:
             return "nonce already seen within the timestamp window"
         return None

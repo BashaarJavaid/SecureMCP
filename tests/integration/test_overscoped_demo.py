@@ -42,9 +42,7 @@ async def demo_gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gatew
     }
     policy_path = tmp_path / "demo-policy.yaml"
     policy_path.write_text(yaml.safe_dump(policy))
-    async with running_gateway(
-        policy_path, f"{sys.executable} {OVERSCOPED_SERVER}", keys
-    ) as gw:
+    async with running_gateway(policy_path, f"{sys.executable} {OVERSCOPED_SERVER}", keys) as gw:
         yield gw
 
 

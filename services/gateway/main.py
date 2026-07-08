@@ -70,9 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     sweep = asyncio.create_task(manager.sweep_loop())
     # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(
-        signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer))
-    )
+    loop.add_signal_handler(signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer)))
     try:
         yield
     finally:
@@ -151,9 +149,7 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
             session = await manager.create(identity_id)
         except Exception:
             logger.exception("session_creation_failed", identity=identity_id)
-            await Response("session could not be created", status_code=503)(
-                scope, receive, send
-            )
+            await Response("session could not be created", status_code=503)(scope, receive, send)
             return
     else:
         await Response("missing mcp-session-id header", status_code=400)(scope, receive, send)

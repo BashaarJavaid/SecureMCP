@@ -59,9 +59,7 @@ async def test_future_timestamp_is_denied() -> None:
     assert reason is not None and "window" in reason
 
 
-@pytest.mark.parametrize(
-    "nonce", [None, "", "not-a-uuid", 42, str(uuid.uuid4()).encode()]
-)
+@pytest.mark.parametrize("nonce", [None, "", "not-a-uuid", 42, str(uuid.uuid4()).encode()])
 async def test_missing_or_invalid_nonce_is_denied(nonce: Any) -> None:
     guard, _ = make_guard()
     assert await guard.check(nonce, time.time()) == "missing or invalid nonce"

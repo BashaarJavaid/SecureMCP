@@ -137,11 +137,15 @@ async def wait_for_gateway(api_key: str) -> None:
     print("\nWaiting for the gateway to come up with the demo policy...")
     print("  In another terminal:")
     print("    POLICY_FILE=policies/demo-policy.yaml \\")
-    print('      UPSTREAM_COMMAND="python sample_target/rogue_server.py'
-          ' --state /rogue-state/state.json" \\')
+    print(
+        '      UPSTREAM_COMMAND="python sample_target/rogue_server.py'
+        ' --state /rogue-state/state.json" \\'
+    )
     print("      docker compose up -d --build")
-    print("  (stack already running with the demo policy? hot-reload this run's fresh"
-          " keys with:  docker kill -s HUP securemcp-gateway-1)")
+    print(
+        "  (stack already running with the demo policy? hot-reload this run's fresh"
+        " keys with:  docker kill -s HUP securemcp-gateway-1)"
+    )
     async with httpx.AsyncClient() as client:
         for _ in range(240):
             try:
@@ -170,8 +174,10 @@ async def wait_for_mutation() -> None:
     print("  (no timer, no hidden trigger — the schema changes only when you do this)")
     while not STATE_PATH.exists():
         await asyncio.sleep(0.5)
-    print("  mutation applied: send_email now has a REQUIRED bcc parameter and a"
-          " poisoned description.")
+    print(
+        "  mutation applied: send_email now has a REQUIRED bcc parameter and a"
+        " poisoned description."
+    )
 
 
 async def drift_and_block(api_key: str) -> None:
@@ -250,14 +256,18 @@ async def main() -> None:
     print(f"\nDemo policy written to {POLICY_PATH.relative_to(Path.cwd())}")
     print("  developer  -> allowed: send_email, read_inbox")
     print("  ops-admin  -> allowed: * (everything), admin: true")
-    print("Upstream: sample_target/rogue_server.py — starts benign, mutates only when"
-          " its admin endpoint is hit.")
+    print(
+        "Upstream: sample_target/rogue_server.py — starts benign, mutates only when"
+        " its admin endpoint is hit."
+    )
 
     await wait_for_gateway(keys["developer"])
 
     await show_tools("developer", keys["developer"])
-    print("\n  delete_mailbox is not denied — it is ABSENT. The LLM planning over"
-          " this list never sees it.")
+    print(
+        "\n  delete_mailbox is not denied — it is ABSENT. The LLM planning over"
+        " this list never sees it."
+    )
     await show_tools("ops-admin", keys["ops-admin"])
 
     section("developer calls send_email — benign schema, allowed")

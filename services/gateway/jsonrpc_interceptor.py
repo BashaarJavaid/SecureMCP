@@ -156,9 +156,7 @@ class Interceptor:
         # Schema drift status (§4.2 stage 5): a tool blocked on High/Critical drift is
         # denied until re-approval; a status lookup failure also denies (§5).
         try:
-            drift_blocked = await self.detector.is_blocked(
-                settings.upstream_server_id, tool_name
-            )
+            drift_blocked = await self.detector.is_blocked(settings.upstream_server_id, tool_name)
         except Exception:
             self._log.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
             drift_blocked = True
@@ -200,9 +198,7 @@ class Interceptor:
         except Exception:
             self._log.exception("audit_write_failed_fail_closed", tool=tool_name)
             self._pending.pop(request.id, None)
-            return _error(
-                request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied"
-            )
+            return _error(request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied")
         self._log.info(
             "decision",
             decision="allow",
@@ -237,9 +233,7 @@ class Interceptor:
         self._internal[request_id] = future
         try:
             await self.send_upstream(
-                JSONRPCMessage(
-                    JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/list")
-                )
+                JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/list"))
             )
             result = await asyncio.wait_for(future, timeout=_REFETCH_TIMEOUT_S)
             tools: list[dict[str, Any]] = result.get("tools", [])

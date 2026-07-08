@@ -17,7 +17,5 @@ def prune(
     engine: PolicyEngine,
 ) -> list[dict[str, Any]]:
     return [
-        tool
-        for tool in tools
-        if engine.is_allowed(identity_id, server_id, str(tool.get("name")))
+        tool for tool in tools if engine.is_allowed(identity_id, server_id, str(tool.get("name")))
     ]

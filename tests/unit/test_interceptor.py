@@ -62,9 +62,7 @@ class FakeDetector:
         self.blocked: set[str] = set()
         self.checked: list[list[dict[str, Any]]] = []
 
-    async def check(
-        self, server_id: str, tools: list[dict[str, Any]], identity_id: str
-    ) -> None:
+    async def check(self, server_id: str, tools: list[dict[str, Any]], identity_id: str) -> None:
         self.checked.append(tools)
 
     async def is_blocked(self, server_id: str, tool_name: str) -> bool:

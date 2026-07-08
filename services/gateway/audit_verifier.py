@@ -67,9 +67,7 @@ async def verify_increment(
 
         if verified:
             if checkpoint is None:
-                session.add(
-                    VerifierCheckpoint(id=CHECKPOINT_ID, last_verified_seq=last_verified)
-                )
+                session.add(VerifierCheckpoint(id=CHECKPOINT_ID, last_verified_seq=last_verified))
             else:
                 checkpoint.last_verified_seq = last_verified
             await session.commit()
