@@ -10,6 +10,7 @@ from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
 from services.gateway import logging_config
+from services.gateway.approvals import APPROVAL_META_KEY
 from services.gateway.decision import EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
@@ -99,12 +100,44 @@ class FakeCache:
         self.invalidated.append(server_id)
 
 
+class FakeRisk:
+    """Stage-6 stand-in: fixed score (default 0 → continue) or a raised exception."""
+
+    def __init__(self, score: int = 0, error: Exception | None = None) -> None:
+        self.result = (score, [])
+        self.error = error
+
+    async def score(
+        self, identity_id: str, tool_name: str, arguments: dict[str, Any], risk_policy: Any
+    ) -> tuple[int, list[Any]]:
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class FakeApprovals:
+    def __init__(self) -> None:
+        self.redeemed: list[str] = []
+        self.denial: tuple[EventType, str] | None = None
+
+    async def redeem(
+        self, approval_id: str, identity_id: str, tool_name: str, args_hash: str
+    ) -> tuple[EventType, str] | None:
+        self.redeemed.append(approval_id)
+        return self.denial
+
+    async def create(self, identity_id: str, tool_name: str, args_hash: str, audit_id: int) -> str:
+        return "approval-1"
+
+
 async def _no_upstream(message: JSONRPCMessage) -> None:
     raise AssertionError("unexpected gateway-initiated upstream send")
 
 
 def make_interceptor(
-    identity: str = "agent-readonly", with_schema: bool = True
+    identity: str = "agent-readonly",
+    with_schema: bool = True,
+    risk: FakeRisk | None = None,
 ) -> tuple[Interceptor, FakeWriter, FakeCache, FakeDetector]:
     writer = FakeWriter()
     cache = FakeCache()
@@ -119,6 +152,8 @@ def make_interceptor(
         cache=cast(Any, cache),
         detector=cast(Any, detector),
         replay=cast(Any, FakeReplay()),
+        risk=cast(Any, risk or FakeRisk()),
+        approvals=cast(Any, FakeApprovals()),
         send_upstream=_no_upstream,
     )
     return interceptor, writer, cache, detector
@@ -418,3 +453,110 @@ async def test_other_meta_content_survives_the_strip() -> None:
     )
     assert isinstance(outcome, Forward)
     assert outcome.message.message.root.params["_meta"] == {"progressToken": "tok-1"}
+
+
+# --- Risk Engine stage 6 (item 16) ---
+
+
+@pytest.mark.parametrize(
+    ("score", "expected_event"),
+    [
+        (39, EventType.ALLOW),  # continue: eventually forwarded
+        (40, EventType.CHALLENGE),
+        (69, EventType.CHALLENGE),
+        (70, EventType.HUMAN_APPROVAL_REQUIRED),
+        (90, EventType.HUMAN_APPROVAL_REQUIRED),
+        (91, EventType.DENY_RISK),
+    ],
+)
+async def test_risk_threshold_boundaries(score: int, expected_event: EventType) -> None:
+    """§4.8 exact bands: <40 continue, 40-69 challenge, 70-90 approval, >90 deny."""
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(score))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert writer.events == [expected_event]
+    if expected_event is EventType.ALLOW:
+        assert isinstance(outcome, Forward)
+    else:
+        assert isinstance(outcome, Respond)
+        data = outcome.message.message.root.error.data
+        assert data["event_type"] == expected_event.value
+        assert data["risk_score"] == score
+
+
+async def test_human_approval_decision_carries_approval_id() -> None:
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(75))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    data = outcome.message.message.root.error.data
+    assert data["decision"] == "human_approval_required"
+    assert data["approval_id"] == "approval-1"  # FakeApprovals
+    assert data["audit_id"] == "42"
+
+
+async def test_risk_scoring_exception_fails_closed_as_deny_risk() -> None:
+    """§5: a crashed risk calculation is maximum risk, not low risk."""
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(error=RuntimeError("redis down")))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    data = outcome.message.message.root.error.data
+    assert data["event_type"] == "DENY_RISK"
+    assert data["risk_score"] == 100
+    assert writer.events == [EventType.DENY_RISK]
+
+
+async def test_risk_runs_before_param_validation() -> None:
+    """Pipeline order regression (§4.2): stage 6 terminates before stage 7 sees the
+    call — invalid arguments must not surface as DENY_VALIDATION when risk trips."""
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(40))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {}})  # missing required "text"
+    )
+    assert isinstance(outcome, Respond)
+    assert writer.events == [EventType.CHALLENGE]
+
+
+async def test_approved_retry_redeems_and_skips_risk_scoring() -> None:
+    """A valid securmcp/approval_id bypasses stage 6 (a human approved this exact
+    call) but not param validation; the approval meta key never leaks upstream."""
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(91))  # would deny if scored
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "hi"},
+                "_meta": {**fresh_meta(), APPROVAL_META_KEY: "approval-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]
+    assert "_meta" not in outcome.message.message.root.params
+    assert cast(Any, interceptor.approvals).redeemed == ["approval-1"]
+
+
+async def test_rejected_approval_id_is_denied_with_its_classification() -> None:
+    interceptor, writer, _, _ = make_interceptor()
+    cast(Any, interceptor.approvals).denial = (
+        EventType.DENY_APPROVAL_MISMATCH,
+        "arguments differ from the ones that were approved",
+    )
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "mutated"},
+                "_meta": {**fresh_meta(), APPROVAL_META_KEY: "approval-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_APPROVAL_MISMATCH"
+    assert writer.events == [EventType.DENY_APPROVAL_MISMATCH]

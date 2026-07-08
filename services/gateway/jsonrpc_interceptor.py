@@ -34,12 +34,14 @@ from mcp.types import (
 )
 
 from services.gateway import param_validator, schema_pruner
+from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
-from services.gateway.decision import Decision, DecisionOutcome, EventType
+from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
+from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 
 # Implementation-defined JSON-RPC error codes; the canonical Decision object (§4.3)
@@ -88,6 +90,8 @@ class Interceptor:
     cache: SchemaCache
     detector: DriftDetector
     replay: ReplayGuard
+    risk: RiskEngine
+    approvals: ApprovalStore
     send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
@@ -170,9 +174,51 @@ class Interceptor:
                 ["drift_detector"],
             )
 
+        # Risk Engine (§4.2 stage 6, before param validation). A retry carrying an
+        # approval id redeems it instead of re-scoring: a human reviewed this exact
+        # call (§4.8); RBAC/drift/replay above and param validation below still apply.
+        arguments = params.get("arguments", {}) or {}
+        approval_id = meta.get(APPROVAL_META_KEY)
+        risk_score: int | None = None
+        risk_factors: list[RiskFactor] | None = None
+        if approval_id is not None:
+            try:
+                denial = await self.approvals.redeem(
+                    str(approval_id), self.identity_id, tool_name, arguments_hash(arguments)
+                )
+            except Exception:
+                self._log.exception("approval_redeem_failed_fail_closed", tool=tool_name)
+                denial = (EventType.DENY_APPROVAL_MISMATCH, "approval store unavailable")
+            if denial is not None:
+                event_type, reason = denial
+                return await self._deny(
+                    request, tool_name, event_type, reason, ["approval_lifecycle"]
+                )
+        else:
+            try:
+                risk_score, risk_factors = await self.risk.score(
+                    self.identity_id, tool_name, arguments, self.engine.policy.risk
+                )
+            except Exception:
+                # A crashed risk calculation is maximum risk, not low risk (§5).
+                self._log.exception("risk_scoring_failed_fail_closed", tool=tool_name)
+                risk_score, risk_factors = (
+                    100,
+                    [
+                        RiskFactor(
+                            factor="risk_engine_unavailable",
+                            contribution=100,
+                            reason="risk scoring failed; treated as maximum risk",
+                        )
+                    ],
+                )
+            if risk_score >= 40:
+                return await self._risk_terminal(
+                    request, tool_name, arguments, risk_score, risk_factors
+                )
+
         # Parameter validation (§4.2 stage 7, §4.8): cache miss triggers a transparent
         # upstream re-fetch (§8); only an unfetchable schema fails closed.
-        arguments = params.get("arguments", {}) or {}
         input_schema = await self._input_schema_for(tool_name)
         if input_schema is None:
             return await self._deny_validation(
@@ -188,12 +234,17 @@ class Interceptor:
         payload_extra: dict[str, object] = {"arguments": arguments}
         if sanitized_fields:
             payload_extra["sanitized_fields"] = sanitized_fields
+        if risk_factors:
+            payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
+        if approval_id is not None:
+            payload_extra["approval_id"] = str(approval_id)
         try:
             seq = await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
+                risk_score=risk_score,
             )
         except Exception:
             self._log.exception("audit_write_failed_fail_closed", tool=tool_name)
@@ -206,9 +257,10 @@ class Interceptor:
             tool=tool_name,
             audit_id=str(seq),
         )
-        # The nonce/timestamp pair is gateway-facing only — it must not leak upstream.
+        # The nonce/timestamp/approval-id trio is gateway-facing only — never upstream.
         meta.pop(NONCE_META_KEY, None)
         meta.pop(TIMESTAMP_META_KEY, None)
+        meta.pop(APPROVAL_META_KEY, None)
         if not meta:
             params.pop("_meta", None)
         return Forward(message)
@@ -253,6 +305,8 @@ class Interceptor:
         event_type: EventType,
         reason: str,
         matched_rules: list[str],
+        risk_score: int | None = None,
+        risk_factors: list[RiskFactor] | None = None,
     ) -> Respond:
         """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
         row seq as audit_id. The deny stands even if the audit write fails."""
@@ -262,14 +316,20 @@ class Interceptor:
             event_type=event_type,
             reason=reason,
             matched_rules=matched_rules,
+            risk_score=risk_score,
+            risk_factors=risk_factors,
             policy_version=self.engine.version,
         )
+        payload_extra: dict[str, Any] = {"reason": decision.reason}
+        if risk_factors:
+            payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         try:
             seq = await self.writer.write(
                 event_type,
                 self.identity_id,
                 tool_name=tool_name,
-                payload_extra={"reason": decision.reason},
+                payload_extra=payload_extra,
+                risk_score=risk_score,
             )
             decision.audit_id = str(seq)
         except Exception:
@@ -280,12 +340,99 @@ class Interceptor:
             event_type=event_type.value,
             tool=tool_name,
             reason=decision.reason,
+            risk_score=risk_score,
             audit_id=decision.audit_id,
         )
         return _error(
             request.id,
             POLICY_DENIED_CODE,
             decision.reason,
+            data=decision.model_dump(mode="json"),
+        )
+
+    async def _risk_terminal(
+        self,
+        request: JSONRPCRequest,
+        tool_name: str,
+        arguments: dict[str, Any],
+        risk_score: int,
+        risk_factors: list[RiskFactor],
+    ) -> Respond:
+        """Stage 6 terminal outcomes (§4.8 thresholds): 40-69 CHALLENGE, 70-90
+        HUMAN_APPROVAL_REQUIRED (creates the approvals row), >90 DENY_RISK. No
+        upstream forward in any of these; the canonical Decision travels in
+        error.data with the score and contributing factors."""
+        if risk_score > 90:
+            return await self._deny(
+                request,
+                tool_name,
+                EventType.DENY_RISK,
+                f"risk score {risk_score} for {tool_name!r} exceeds the deny threshold (90)",
+                ["risk_engine"],
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
+        self._pending.pop(request.id, None)
+        if risk_score >= 70:
+            outcome = DecisionOutcome.HUMAN_APPROVAL_REQUIRED
+            event_type = EventType.HUMAN_APPROVAL_REQUIRED
+            reason = (
+                f"risk score {risk_score} for {tool_name!r} requires human approval;"
+                " retry with the approval id once granted"
+            )
+        else:
+            # v1 challenge is terminal: a distinct error the client surfaces to a
+            # human for confirmation; a real step-up auth flow is Phase 4 (§4.8).
+            outcome = DecisionOutcome.CHALLENGE
+            event_type = EventType.CHALLENGE
+            reason = f"risk score {risk_score} for {tool_name!r} requires confirmation"
+        decision = Decision(
+            decision=outcome,
+            event_type=event_type,
+            reason=reason,
+            matched_rules=["risk_engine"],
+            risk_score=risk_score,
+            risk_factors=risk_factors,
+            policy_version=self.engine.version,
+        )
+        try:
+            seq = await self.writer.write(
+                event_type,
+                self.identity_id,
+                tool_name=tool_name,
+                payload_extra={
+                    "reason": reason,
+                    "risk_factors": [f.model_dump(mode="json") for f in risk_factors],
+                },
+                risk_score=risk_score,
+            )
+            decision.audit_id = str(seq)
+            if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
+                # The approvals row references this audit seq (§4.8) — audit-first,
+                # and the hash is over the pre-sanitize arguments (see approvals.py).
+                decision.approval_id = await self.approvals.create(
+                    self.identity_id, tool_name, arguments_hash(arguments), seq
+                )
+        except Exception:
+            # No record (or no approval row) means the call cannot proceed anyway,
+            # and unlike a plain deny an approval decision is useless without its
+            # row — fail closed as unavailable (§5).
+            self._log.exception("risk_hold_failed_fail_closed", tool=tool_name)
+            return _error(request.id, AUDIT_UNAVAILABLE_CODE, "audit log unavailable; call denied")
+        self._log.info(
+            "decision",
+            decision=outcome.value,
+            event_type=event_type.value,
+            tool=tool_name,
+            reason=reason,
+            risk_score=risk_score,
+            audit_id=decision.audit_id,
+            approval_id=decision.approval_id,
+        )
+        return _error(
+            request.id,
+            POLICY_DENIED_CODE,
+            reason,
             data=decision.model_dump(mode="json"),
         )
 

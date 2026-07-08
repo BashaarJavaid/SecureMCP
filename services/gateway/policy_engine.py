@@ -8,12 +8,27 @@ fails startup — fail closed (ARCHITECTURE.md §5).
 
 import hashlib
 from pathlib import Path
+from typing import Literal
 
 import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict
 
 logger = structlog.get_logger(__name__)
+
+SensitivityTier = Literal["low", "medium", "high", "critical"]
+
+
+class RiskPolicy(BaseModel):
+    """Static Risk Engine inputs (§4.8, item 16): the sensitivity tier per tool and the
+    blast-radius protected list. Factor weights stay code constants in risk_engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Tool name -> tier; unlisted tools contribute 0.
+    tool_sensitivity: dict[str, SensitivityTier] = {}
+    # fnmatch patterns matched against every string argument value (repos, paths).
+    protected_repos: list[str] = []
 
 
 class ServerGrant(BaseModel):
@@ -39,6 +54,7 @@ class PolicyFile(BaseModel):
 
     version: int
     identities: list[Identity] = []
+    risk: RiskPolicy = RiskPolicy()
 
 
 class PolicyEngine:

@@ -39,6 +39,8 @@ class DecisionOutcome(StrEnum):
 class RiskFactor(BaseModel):
     factor: str
     contribution: int
+    # Human-readable explanation per §4.8's factor interface (surfaced by item 20).
+    reason: str | None = None
 
 
 class Decision(BaseModel):
@@ -51,3 +53,6 @@ class Decision(BaseModel):
     policy_version: int
     # None until the audit log writer lands (Phase 1, item 5).
     audit_id: str | None = None
+    # Set only on HUMAN_APPROVAL_REQUIRED: the id the client passes back via
+    # params._meta["securmcp/approval_id"] on the approved retry (§4.8).
+    approval_id: str | None = None

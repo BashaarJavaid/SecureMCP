@@ -63,6 +63,9 @@ async def clean_audit() -> None:
     try:
         await redis_client.ping()
         await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
+        risk_keys = await redis_client.keys("risk:*")
+        if risk_keys:
+            await redis_client.delete(*risk_keys)
     except Exception:
         pytest.skip("redis not reachable — run: docker compose up -d redis")
     finally:
@@ -75,6 +78,7 @@ async def clean_audit() -> None:
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
             await conn.execute(text("TRUNCATE tool_baselines"))
             await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
+            await conn.execute(text("TRUNCATE approvals"))
     except Exception:
         pytest.skip("postgres not reachable — run: docker compose up -d postgres")
 

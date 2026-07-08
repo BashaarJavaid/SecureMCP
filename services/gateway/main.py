@@ -13,6 +13,7 @@ from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
 from services.gateway import auth, logging_config, signing
+from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import async_session
@@ -20,6 +21,7 @@ from services.gateway.decision import Decision, DecisionOutcome, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
+from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
@@ -58,6 +60,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     writer = AuditWriter(redis_client, async_session, store, signing_key)
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
+    risk_engine = RiskEngine(redis_client, detector)
+    app.state.risk_engine = risk_engine
+    approval_store = ApprovalStore(async_session, writer)
+    app.state.approval_store = approval_store
+    # Restart-durable approvals (§4.8): expire pending rows whose TTL lapsed while
+    # the gateway was down before serving traffic.
+    await approval_store.expire_stale()
     manager = SessionManager(
         redis_client,
         store,
@@ -65,6 +74,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         SchemaCache(redis_client),
         detector,
         ReplayGuard(redis_client, settings.replay_window_seconds),
+        risk_engine,
+        approval_store,
     )
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
@@ -112,6 +123,39 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
         matched_rules=["admin_approval"],
         policy_version=store.engine.version,
         audit_id=str(seq),
+    )
+    return decision.model_dump(mode="json")
+
+
+@app.post("/admin/approvals/{approval_id}/approve")
+async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
+    """Human approval grant (§4.8, item 16): flips a pending approval to approved so
+    the client's retry (params._meta["securmcp/approval_id"]) can redeem it once.
+    Also applies one risk-decay step for the (identity, tool) pair — a human judged
+    this high-risk call fine, and that calibrates future behavioral scoring."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = auth.resolve_identity(request.headers.get(KEY_HEADER), store.engine)
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    approval_store: ApprovalStore = request.app.state.approval_store
+    try:
+        seq, requester_id, tool_name = await approval_store.approve(
+            approval_id, approved_by=identity_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    risk_engine: RiskEngine = request.app.state.risk_engine
+    await risk_engine.apply_decay(requester_id, tool_name)
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.APPROVED,
+        reason=f"call to {tool_name!r} approved by {identity_id!r}",
+        matched_rules=["admin_approval"],
+        policy_version=store.engine.version,
+        audit_id=str(seq),
+        approval_id=approval_id,
     )
     return decision.model_dump(mode="json")
 

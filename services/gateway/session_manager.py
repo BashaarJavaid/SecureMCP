@@ -19,6 +19,7 @@ from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage
 
 from services.gateway import upstream_client
+from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
 from services.gateway.decision import EventType
@@ -26,6 +27,7 @@ from services.gateway.drift_detector import DriftDetector
 from services.gateway.jsonrpc_interceptor import Interceptor, Respond
 from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
+from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 
 logger = structlog.get_logger(__name__)
@@ -56,6 +58,8 @@ class SessionManager:
         schema_cache: SchemaCache,
         drift_detector: DriftDetector,
         replay_guard: ReplayGuard,
+        risk_engine: RiskEngine,
+        approval_store: ApprovalStore,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
@@ -63,6 +67,8 @@ class SessionManager:
         self._schema_cache = schema_cache
         self._drift_detector = drift_detector
         self._replay_guard = replay_guard
+        self._risk_engine = risk_engine
+        self._approval_store = approval_store
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -94,6 +100,8 @@ class SessionManager:
                 cache=self._schema_cache,
                 detector=self._drift_detector,
                 replay=self._replay_guard,
+                risk=self._risk_engine,
+                approvals=self._approval_store,
                 send_upstream=send_upstream,
             ),
         )

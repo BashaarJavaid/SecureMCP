@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from services.gateway import risk_engine
 from services.gateway.config import settings
 from tests.integration.conftest import (  # noqa: F401  (fixtures re-exported)
     Gateway,
@@ -28,7 +29,19 @@ def set_mutation(mutation: str) -> None:
 
 
 @pytest.fixture
-async def drift_gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:  # noqa: F811
+async def drift_gateway(
+    clean_audit: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[Gateway]:
+    # These tests assert drift *classification* behavior; drop the clock-dependent
+    # business-hours risk factor so an off-hours run doesn't push an unresolved
+    # Low/Medium drift (drift_in_review, +15) over the challenge threshold.
+    monkeypatch.setattr(
+        risk_engine,
+        "FACTORS",
+        [fn for fn in risk_engine.FACTORS if fn is not risk_engine._business_hours],
+    )
     keys = {"dev": secrets.token_urlsafe(32), "admin": secrets.token_urlsafe(32)}
     policy = {
         "version": 1,

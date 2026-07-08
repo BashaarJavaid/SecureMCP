@@ -71,6 +71,31 @@ class ToolBaseline(Base):
     observed_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
 
+class Approval(Base):
+    """Human-approval lifecycle row (§4.8, item 16): created when a call lands in
+    HUMAN_APPROVAL_REQUIRED, tied to that decision's audit row. Postgres-backed so a
+    gateway restart doesn't lose pending approvals. `consumed` enforces one-time use;
+    `arguments_hash` is re-checked at redemption (TOCTOU, DENY_APPROVAL_MISMATCH)."""
+
+    __tablename__ = "approvals"
+
+    approval_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    audit_id: Mapped[int] = mapped_column(BigInteger)
+    identity_id: Mapped[str] = mapped_column(Text)
+    tool_name: Mapped[str] = mapped_column(Text)
+    arguments_hash: Mapped[str] = mapped_column(CHAR(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(Text, default="pending")  # pending/approved/expired
+    approved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed: Mapped[bool] = mapped_column(default=False)
+
+    __table_args__ = (Index("idx_approvals_status_expiry", "status", "expires_at"),)
+
+
 class VerifierCheckpoint(Base):
     """Single-row (id=1) last_verified_seq checkpoint for the audit verifier daemon —
     verification resumes forward from here instead of rescanning from seq=1 (§4.8)."""

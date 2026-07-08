@@ -46,7 +46,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15). Phase 3 is next, starting with item 16: Risk Engine v1 — factor-list scoring (tool sensitivity, blast radius, business hours, call frequency, drift-in-review) plus the risk decay feedback loop (per-identity/tool calibration counter on approval, behavioral factors only, never the static sensitivity tier).
+See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — item 16 (Risk Engine v1 + risk decay + human-approval lifecycle) is done. Next is item 17: ABAC conditions layered onto the policy engine (embedded expression evaluator; explicitly no loops/recursion/arbitrary code; missing-attribute references evaluate the whole condition as not-satisfied, never injected as a raw boolean into a `not`).
 
 ---
 

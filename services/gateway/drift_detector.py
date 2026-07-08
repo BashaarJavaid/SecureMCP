@@ -223,6 +223,19 @@ class DriftDetector:
             )
         )
 
+    async def has_pending_drift(self, server_id: str, tool_name: str) -> bool:
+        """Unresolved observed drift at any severity — the Risk Engine's drift-in-review
+        signal (§4.8): Low/Medium drift doesn't block but still elevates risk. Blocked
+        tools never reach risk scoring (stage 5 denies first)."""
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(ToolBaseline.observed_hash).where(
+                    ToolBaseline.server_id == server_id,
+                    ToolBaseline.tool_name == tool_name,
+                )
+            )
+            return result.scalar_one_or_none() is not None
+
     async def is_blocked(self, server_id: str, tool_name: str) -> bool:
         async with self._sessions() as session:
             result = await session.execute(
