@@ -9,16 +9,17 @@ Canonicalization is canonicaljson (pinned) — see the key-reordering smoke test
 """
 
 import hashlib
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
 
 import canonicaljson
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.gateway.audit_log import AuditWriter
-from services.gateway.db import ToolBaseline
+from services.gateway.db import AuditLog, ToolBaseline
 from services.gateway.decision import EventType
 
 logger = structlog.get_logger(__name__)
@@ -235,6 +236,26 @@ class DriftDetector:
                 )
             )
             return result.scalar_one_or_none() is not None
+
+    async def recent_drift_count(self, server_id: str, tool_name: str, window_seconds: int) -> int:
+        """DRIFT_* audit events for this tool within the window — the Risk Engine's
+        drift-history signal (§4.8, item 18): counts survive re-approval by design,
+        because the audit log, not tool_baselines, is the source of truth. Raises on
+        DB failure — the scoring caller fails closed."""
+        since = datetime.now(UTC) - timedelta(seconds=window_seconds)
+        drift_events = [severity.event.value for severity in DriftSeverity]
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.event_type.in_(drift_events),
+                    AuditLog.server_id == server_id,
+                    AuditLog.tool_name == tool_name,
+                    AuditLog.timestamp > since,
+                )
+            )
+            return int(result.scalar_one())
 
     async def is_blocked(self, server_id: str, tool_name: str) -> bool:
         async with self._sessions() as session:

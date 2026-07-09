@@ -414,6 +414,12 @@ class Interceptor:
         """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
         row seq as audit_id. The deny stands even if the audit write fails."""
         self._pending.pop(request.id, None)
+        try:
+            # Prior-denial-rate telemetry (§4.8, item 18): best-effort — a counting
+            # failure must not disturb the deny itself.
+            await self.risk.record_denial(self.identity_id)
+        except Exception:
+            self._log.exception("denial_count_unavailable", tool=tool_name)
         decision = Decision(
             decision=DecisionOutcome.DENY,
             event_type=event_type,

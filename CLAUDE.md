@@ -46,7 +46,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — items 16 (Risk Engine v1 + risk decay + human-approval lifecycle) and 17 (ABAC conditions: load-time-compiled boolean expressions on ServerGrants, `services/gateway/abac.py`) are done. Next is item 18: richer risk telemetry — prior-denial-rate, drift-history, and an auth-failure counter added to the Auth Layer.
+See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — items 16 (Risk Engine v1 + risk decay + human-approval lifecycle), 17 (ABAC conditions: load-time-compiled boolean expressions on ServerGrants, `services/gateway/abac.py`), and 18 (richer risk telemetry: prior-denial-rate, drift-history, gateway-wide auth-failure counter) are done. Next is item 19: policy versioning (version stamping, revision snapshots, rollback) plus the `--diff-policy` terminal mode and `--html` side-by-side diff flag.
 
 ---
 

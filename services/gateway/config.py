@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     risk_freq_threshold: int = 10
     # Risk decay (§4.8): offset added per admin approval, behavioral factors only.
     risk_decay_step: int = 5
+    # Richer risk telemetry (§4.8, item 18). Prior-denial-rate: fires when an identity
+    # collects more than this many DENY_* terminals within the window.
+    risk_denial_window_seconds: int = 600
+    risk_denial_threshold: int = 3
+    # Auth-failure factor: one gateway-wide counter of failed API-key lookups; fires
+    # for every identity while more than this many failures sit within the window.
+    risk_auth_failure_window_seconds: int = 300
+    risk_auth_failure_threshold: int = 5
+    # Drift-history factor: fires when a tool has this many DRIFT_* audit events in
+    # the window, even if re-approved ("changed shape twice in the last week").
+    risk_drift_history_window_seconds: int = 604800
+    risk_drift_history_threshold: int = 2
     # Human approval lifecycle (§4.8): pending approvals expire after this TTL.
     approval_ttl_seconds: int = 900
 

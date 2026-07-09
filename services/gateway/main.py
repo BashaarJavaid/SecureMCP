@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.policy_store = store
     signing_key = signing.load_private_key(settings.signing_key_file)
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
     writer = AuditWriter(redis_client, async_session, store, signing_key)
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
@@ -106,7 +107,9 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
     """Drift re-approval (§4.8): snapshot the observed schema as the accepted baseline.
     Audited, authenticated admin action — requires a key resolving to an admin identity."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = auth.resolve_identity(request.headers.get(KEY_HEADER), store.engine)
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid or missing API key")
     if not store.engine.is_admin(identity_id):
@@ -134,7 +137,9 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
     Also applies one risk-decay step for the (identity, tool) pair — a human judged
     this high-risk call fine, and that calibrates future behavioral scoring."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = auth.resolve_identity(request.headers.get(KEY_HEADER), store.engine)
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid or missing API key")
     if not store.engine.is_admin(identity_id):
@@ -167,8 +172,10 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     session_id = headers.get(MCP_SESSION_ID_HEADER)
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
-    identity_id = auth.resolve_identity(
-        headers.get(KEY_HEADER), scope["app"].state.policy_store.engine
+    identity_id = await auth.resolve_identity_tracked(
+        headers.get(KEY_HEADER),
+        scope["app"].state.policy_store.engine,
+        scope["app"].state.redis,
     )
     if identity_id is None:
         await Response("invalid or missing API key", status_code=401)(scope, receive, send)

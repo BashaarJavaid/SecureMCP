@@ -6,9 +6,15 @@ them (a common-interface function list, deliberately not a plugin system) into a
 0-100 score. Deterministic and rule-based by design — no ML, ever (§4.8).
 
 Risk decay (§4.8): a per-(identity, tool) Redis counter, incremented on each admin
-approval, discounts the *behavioral* subtotal (call frequency, drift-in-review) —
-never the static tool-sensitivity tier — floored at 0, so rubber-stamp approvals
-can't desensitize the engine to an inherently dangerous tool.
+approval, discounts the *behavioral* subtotal (call frequency, prior-denial-rate,
+drift-in-review) — never the static tool-sensitivity tier — floored at 0, so
+rubber-stamp approvals can't desensitize the engine to an inherently dangerous tool.
+
+Item 18 telemetry: prior-denial-rate (per-identity Redis rolling counter, bumped by
+the interceptor on every DENY_* terminal), auth-failures (the Auth Layer's gateway-
+wide failed-lookup counter), and drift-history (DRIFT_* audit events for the tool in
+a rolling window, surviving re-approval). Counter *writes* are best-effort at their
+call sites; the *reads* here raise on failure like every other input — fail closed.
 
 Scoring exceptions propagate to the caller, which must treat them as score 100 and
 deny (§5 fail-closed).
@@ -22,22 +28,30 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from services.gateway import auth
 from services.gateway.config import settings
 from services.gateway.decision import RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import RiskPolicy
 
 # Weighted contributions. Anchored to §4.3's worked example (protected repo 30,
-# business hours 25); the tier ladder is chosen so the §11 canary scenario
-# (high-sensitivity tool + protected repo + off-hours = 85) lands in 70-90.
+# business hours 25, prior denial rate ~25); the tier ladder is chosen so the §11
+# canary scenario (high-sensitivity tool + protected repo + off-hours = 85) lands
+# in 70-90 — the item-18 factors need their own triggers and leave it untouched.
 TIER_CONTRIBUTION = {"low": 10, "medium": 20, "high": 30, "critical": 45}
 PROTECTED_CONTRIBUTION = 30
 OFF_HOURS_CONTRIBUTION = 25
 FREQUENCY_CONTRIBUTION = 20
 DRIFT_IN_REVIEW_CONTRIBUTION = 15
+PRIOR_DENIAL_CONTRIBUTION = 25
+AUTH_FAILURE_CONTRIBUTION = 20
+DRIFT_HISTORY_CONTRIBUTION = 15
 
-# Factors risk decay may discount (§4.8 boundary: behavioral only, never the tier).
-BEHAVIORAL_FACTORS = frozenset({"call_frequency", "drift_in_review"})
+# Factors risk decay may discount — §4.8 names them exactly: call frequency,
+# prior-denial-rate, drift-in-review; never the tier, and deliberately not
+# auth_failures/drift_history (approving one call shouldn't erase a gateway-wide
+# stuffing signal or a tool's instability record).
+BEHAVIORAL_FACTORS = frozenset({"call_frequency", "prior_denial_rate", "drift_in_review"})
 
 
 @dataclass
@@ -49,6 +63,9 @@ class RiskContext:
     now: datetime  # timezone-aware UTC
     call_count: int  # calls for this identity+tool in the rolling window, incl. this one
     drift_in_review: bool
+    denial_count: int  # DENY_* terminals for this identity in the rolling window
+    auth_failure_count: int  # gateway-wide failed key lookups in the rolling window
+    drift_event_count: int  # DRIFT_* audit events for this tool in the rolling window
 
 
 def _string_values(value: Any) -> Iterator[str]:
@@ -124,12 +141,55 @@ def _drift_in_review(ctx: RiskContext) -> RiskFactor | None:
     )
 
 
+def _prior_denial_rate(ctx: RiskContext) -> RiskFactor | None:
+    if ctx.denial_count <= settings.risk_denial_threshold:
+        return None
+    return RiskFactor(
+        factor="prior_denial_rate",
+        contribution=PRIOR_DENIAL_CONTRIBUTION,
+        reason=(
+            f"{ctx.denial_count} denials for {ctx.identity_id!r} in the last"
+            f" {settings.risk_denial_window_seconds}s exceeds {settings.risk_denial_threshold}"
+        ),
+    )
+
+
+def _auth_failures(ctx: RiskContext) -> RiskFactor | None:
+    if ctx.auth_failure_count <= settings.risk_auth_failure_threshold:
+        return None
+    return RiskFactor(
+        factor="auth_failures",
+        contribution=AUTH_FAILURE_CONTRIBUTION,
+        reason=(
+            f"{ctx.auth_failure_count} failed API-key lookups gateway-wide in the last"
+            f" {settings.risk_auth_failure_window_seconds}s exceeds"
+            f" {settings.risk_auth_failure_threshold}"
+        ),
+    )
+
+
+def _drift_history(ctx: RiskContext) -> RiskFactor | None:
+    if ctx.drift_event_count < settings.risk_drift_history_threshold:
+        return None
+    return RiskFactor(
+        factor="drift_history",
+        contribution=DRIFT_HISTORY_CONTRIBUTION,
+        reason=(
+            f"{ctx.tool_name!r} drifted {ctx.drift_event_count} times in the last"
+            f" {settings.risk_drift_history_window_seconds}s, even if since re-approved"
+        ),
+    )
+
+
 FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _tool_sensitivity,
     _blast_radius,
     _business_hours,
     _call_frequency,
     _drift_in_review,
+    _prior_denial_rate,
+    _auth_failures,
+    _drift_history,
 ]
 
 
@@ -139,6 +199,10 @@ def _freq_key(identity_id: str, tool_name: str) -> str:
 
 def _decay_key(identity_id: str, tool_name: str) -> str:
     return f"risk:decay:{identity_id}:{tool_name}"
+
+
+def _denial_key(identity_id: str) -> str:
+    return f"risk:denials:{identity_id}"
 
 
 def combine(factors: list[RiskFactor], decay_offset: int) -> int:
@@ -173,6 +237,13 @@ class RiskEngine:
             drift_in_review=await self._detector.has_pending_drift(
                 settings.upstream_server_id, tool_name
             ),
+            denial_count=await self._counter(_denial_key(identity_id)),
+            auth_failure_count=await self._counter(auth.AUTH_FAILURE_KEY),
+            drift_event_count=await self._detector.recent_drift_count(
+                settings.upstream_server_id,
+                tool_name,
+                settings.risk_drift_history_window_seconds,
+            ),
         )
         factors = [factor for fn in FACTORS if (factor := fn(ctx)) is not None]
         decay_raw = await self._redis.get(_decay_key(identity_id, tool_name))
@@ -184,6 +255,18 @@ class RiskEngine:
         if count == 1:
             await self._redis.expire(key, settings.risk_freq_window_seconds)
         return count
+
+    async def _counter(self, key: str) -> int:
+        raw = await self._redis.get(key)
+        return int(raw or 0)
+
+    async def record_denial(self, identity_id: str) -> None:
+        """Count one DENY_* terminal toward the prior-denial-rate window. The caller
+        treats a failure here as best-effort telemetry — the deny already stands."""
+        key = _denial_key(identity_id)
+        count: int = await self._redis.incr(key)
+        if count == 1:
+            await self._redis.expire(key, settings.risk_denial_window_seconds)
 
     async def apply_decay(self, identity_id: str, tool_name: str) -> None:
         """One admin approval = one calibration step (§4.8): grow this pair's offset.

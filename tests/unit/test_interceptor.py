@@ -106,6 +106,8 @@ class FakeRisk:
     def __init__(self, score: int = 0, error: Exception | None = None) -> None:
         self.result = (score, [])
         self.error = error
+        self.denials: list[str] = []
+        self.denial_error: Exception | None = None
 
     async def score(
         self, identity_id: str, tool_name: str, arguments: dict[str, Any], risk_policy: Any
@@ -113,6 +115,11 @@ class FakeRisk:
         if self.error is not None:
             raise self.error
         return self.result
+
+    async def record_denial(self, identity_id: str) -> None:
+        if self.denial_error is not None:
+            raise self.denial_error
+        self.denials.append(identity_id)
 
 
 class FakeApprovals:
@@ -476,6 +483,41 @@ async def test_other_meta_content_survives_the_strip() -> None:
     )
     assert isinstance(outcome, Forward)
     assert outcome.message.message.root.params["_meta"] == {"progressToken": "tok-1"}
+
+
+# --- Prior-denial-rate telemetry hook (item 18) ---
+
+
+async def test_every_deny_terminal_records_one_denial() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    risk = cast(FakeRisk, interceptor.risk)
+    await interceptor.on_client_message(
+        request("tools/call", {"name": "forbidden", "arguments": {}})  # DENY_RBAC
+    )
+    await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"bogus": 1}}, id=2)  # DENY_VALIDATION
+    )
+    assert risk.denials == ["agent-readonly", "agent-readonly"]
+
+
+async def test_allow_records_no_denial() -> None:
+    interceptor, _, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Forward)
+    assert cast(FakeRisk, interceptor.risk).denials == []
+
+
+async def test_denial_count_failure_does_not_disturb_the_deny() -> None:
+    interceptor, writer, _, _ = make_interceptor()
+    cast(FakeRisk, interceptor.risk).denial_error = ConnectionError("redis down")
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "forbidden", "arguments": {}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_RBAC"
+    assert writer.events == [EventType.DENY_RBAC]
 
 
 # --- ABAC conditions stage 4 + deferred risk.* (item 17) ---
