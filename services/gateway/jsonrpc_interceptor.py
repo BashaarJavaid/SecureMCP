@@ -8,8 +8,13 @@ day-one guarantee.
 
 tools/call is authorized here regardless of what the pruned tools/list showed: pruning
 shapes the LLM's planning surface, authorization happens fresh at the point of action
-(§4.1 design principle). Every decision point is audit-logged before it takes effect —
-an ALLOW that can't be recorded is a deny (§5, "no record, no action").
+(§4.1 design principle). The §4.2 pipeline order is replay → RBAC → ABAC → drift →
+risk/approval → param validation; ABAC conditions referencing risk.* can't run at
+stage 4 (no score exists yet), so they're split at policy load and evaluated right
+after scoring, before the threshold mapping — an ABAC deny still wins over
+CHALLENGE/HUMAN_APPROVAL_REQUIRED, matching stage precedence. Every decision point is
+audit-logged before it takes effect — an ALLOW that can't be recorded is a deny (§5,
+"no record, no action").
 
 Schemas come from the shared per-server cache (§8): populated whenever a tools/list
 response flows through, invalidated on initialize, and transparently re-fetched from
@@ -20,6 +25,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -33,7 +39,7 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import param_validator, schema_pruner
+from services.gateway import abac, param_validator, schema_pruner
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
@@ -154,8 +160,20 @@ class Interceptor:
                 ["replay_guard"],
             )
 
-        if not self.engine.is_allowed(self.identity_id, settings.upstream_server_id, tool_name):
+        grant = self.engine.matching_grant(self.identity_id, settings.upstream_server_id, tool_name)
+        if grant is None:
             return await self._deny_rbac(request, tool_name)
+
+        # ABAC conditions (§4.2 stage 4): ALL conditions on the RBAC-matched grant
+        # must hold. Conditions referencing risk.* are deferred until a score exists
+        # (right after stage 6 scoring, below); everything else runs here.
+        conditions = grant.compiled_conditions
+        abac_attrs = self._abac_attributes(tool_name, meta) if conditions else {}
+        denied = await self._enforce_conditions(
+            request, tool_name, [c for c in conditions if not c.references_risk], abac_attrs
+        )
+        if denied is not None:
+            return denied
 
         # Schema drift status (§4.2 stage 5): a tool blocked on High/Critical drift is
         # denied until re-approval; a status lookup failure also denies (§5).
@@ -212,6 +230,21 @@ class Interceptor:
                         )
                     ],
                 )
+            # Deferred ABAC: risk.* conditions run the moment a score exists,
+            # before the threshold mapping — an ABAC deny wins over CHALLENGE /
+            # HUMAN_APPROVAL_REQUIRED (§4.2: stage 4 precedes stage 6). Deliberately
+            # skipped on the redemption branch above: a human approved that exact call.
+            abac_attrs["risk.score"] = risk_score
+            denied = await self._enforce_conditions(
+                request,
+                tool_name,
+                [c for c in conditions if c.references_risk],
+                abac_attrs,
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
+            if denied is not None:
+                return denied
             if risk_score >= 40:
                 return await self._risk_terminal(
                     request, tool_name, arguments, risk_score, risk_factors
@@ -264,6 +297,76 @@ class Interceptor:
         if not meta:
             params.pop("_meta", None)
         return Forward(message)
+
+    def _abac_attributes(self, tool_name: str, meta: dict[str, Any]) -> dict[str, abac.AttrValue]:
+        """The attribute universe conditions resolve against (§4.8): identity.* from
+        the policy identity record (identity.id from the id itself), tool.* from the
+        current call, context.hour from the replay timestamp (already validated by
+        stage 1) in UTC. risk.score is bound later, once stage 6 has scored."""
+        attrs: dict[str, abac.AttrValue] = {
+            "identity.id": self.identity_id,
+            "tool.name": tool_name,
+            "tool.server_id": settings.upstream_server_id,
+        }
+        identity = self.engine.identity(self.identity_id)
+        if identity is not None:
+            for key, value in identity.attributes.items():
+                attrs[f"identity.{key}"] = value
+        timestamp = meta.get(TIMESTAMP_META_KEY)
+        if not isinstance(timestamp, bool) and isinstance(timestamp, int | float):
+            attrs["context.hour"] = datetime.fromtimestamp(timestamp, UTC).hour
+        return attrs
+
+    async def _enforce_conditions(
+        self,
+        request: JSONRPCRequest,
+        tool_name: str,
+        conditions: list[abac.Condition],
+        attrs: dict[str, abac.AttrValue],
+        risk_score: int | None = None,
+        risk_factors: list[RiskFactor] | None = None,
+    ) -> Respond | None:
+        """Evaluate ABAC conditions; None means all satisfied. A condition that is
+        not-satisfied *because it couldn't be evaluated* (unresolvable attribute,
+        type-mismatch, any exception) additionally writes a POLICY_ERROR row — an
+        authoring bug made visible (§4.8) — but the outcome is the same fail-closed
+        DENY_ABAC either way, never pass-through (§5)."""
+        for condition in conditions:
+            problem: str | None = None
+            try:
+                satisfied, missing = abac.evaluate(condition, attrs)
+                if missing:
+                    problem = f"unresolvable attributes: {', '.join(missing)}"
+            except Exception:
+                self._log.exception("abac_evaluation_failed", condition=condition.source)
+                satisfied, problem = False, "condition evaluation raised"
+            if problem is not None:
+                try:
+                    await self.writer.write(
+                        EventType.POLICY_ERROR,
+                        self.identity_id,
+                        tool_name=tool_name,
+                        payload_extra={"condition": condition.source, "reason": problem},
+                    )
+                except Exception:
+                    # Best-effort visibility; the deny below stands regardless.
+                    self._log.exception(
+                        "audit_write_failed", event_type=EventType.POLICY_ERROR.value
+                    )
+            if not satisfied:
+                reason = f"condition {condition.source!r} not satisfied"
+                if problem is not None:
+                    reason += f" ({problem})"
+                return await self._deny(
+                    request,
+                    tool_name,
+                    EventType.DENY_ABAC,
+                    reason,
+                    [f"policy-v{self.engine.version}:abac:{condition.source}"],
+                    risk_score=risk_score,
+                    risk_factors=risk_factors,
+                )
+        return None
 
     async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:
         tools = await self.cache.get(settings.upstream_server_id)

@@ -1,4 +1,3 @@
-# RBAC-only policy (Phase 1, item 3). ABAC `conditions` are rejected until Phase 3, item 17.
 # The identities below are the demo cast for sample_target/overscoped_server.py.
 # api_key_hash values are non-functional placeholders — mint a real key/hash pair with:
 #   python scripts/generate_api_key.py
@@ -21,6 +20,17 @@ identities:
         allowed_tools: ["read_file", "list_issues"]
   - id: "ops-admin"
     api_key_hash: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    # identity.* attributes for ABAC conditions (item 17); identity.id needs no entry.
+    # attributes:
+    #   team: "engineering"
     allowed_servers:
       - server_id: "*"
         allowed_tools: ["*"]
+        # ABAC conditions (Phase 3, item 17): boolean expressions over dotted paths
+        # (identity.* / tool.* / context.hour / risk.score) with ==, !=, <, >, <=, >=,
+        # and/or/not, parentheses — nothing else. ALL listed conditions must hold once
+        # RBAC matches this grant; a condition referencing a missing attribute is
+        # not-satisfied as a whole (never inverted by `not`) and logs POLICY_ERROR.
+        # conditions:
+        #   - "identity.team == 'engineering' and context.hour < 20"
+        #   - "risk.score < 60"

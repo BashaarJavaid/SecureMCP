@@ -138,6 +138,7 @@ def make_interceptor(
     identity: str = "agent-readonly",
     with_schema: bool = True,
     risk: FakeRisk | None = None,
+    policy: PolicyFile | None = None,
 ) -> tuple[Interceptor, FakeWriter, FakeCache, FakeDetector]:
     writer = FakeWriter()
     cache = FakeCache()
@@ -147,7 +148,7 @@ def make_interceptor(
     interceptor = Interceptor(
         identity_id=identity,
         session_id="test-session",
-        store=cast(Any, SimpleNamespace(engine=PolicyEngine(POLICY))),
+        store=cast(Any, SimpleNamespace(engine=PolicyEngine(policy or POLICY))),
         writer=cast(Any, writer),
         cache=cast(Any, cache),
         detector=cast(Any, detector),
@@ -157,6 +158,28 @@ def make_interceptor(
         send_upstream=_no_upstream,
     )
     return interceptor, writer, cache, detector
+
+
+def abac_policy(conditions: list[str], attributes: dict[str, Any] | None = None) -> PolicyFile:
+    return PolicyFile.model_validate(
+        {
+            "version": 1,
+            "identities": [
+                {
+                    "id": "agent-readonly",
+                    "api_key_hash": "sha256:0",
+                    "attributes": {"team": "engineering"} if attributes is None else attributes,
+                    "allowed_servers": [
+                        {
+                            "server_id": "default",
+                            "allowed_tools": ["echo"],
+                            "conditions": conditions,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
 
 
 def fresh_meta() -> dict[str, Any]:
@@ -453,6 +476,149 @@ async def test_other_meta_content_survives_the_strip() -> None:
     )
     assert isinstance(outcome, Forward)
     assert outcome.message.message.root.params["_meta"] == {"progressToken": "tok-1"}
+
+
+# --- ABAC conditions stage 4 + deferred risk.* (item 17) ---
+
+
+async def test_satisfied_conditions_pass_through_to_allow() -> None:
+    policy = abac_policy(["identity.team == 'engineering'", "risk.score < 60"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]
+
+
+async def test_failed_condition_is_denied_abac_before_drift() -> None:
+    policy = abac_policy(["identity.team == 'sales'"])
+    interceptor, writer, _, detector = make_interceptor(policy=policy)
+    detector.blocked.add("echo")  # would be DENY_DRIFT if ABAC ran later than stage 4
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    error = outcome.message.message.root
+    assert error.error.data["event_type"] == "DENY_ABAC"
+    assert error.error.data["decision"] == "deny"
+    assert error.error.data["matched_rules"] == ["policy-v1:abac:identity.team == 'sales'"]
+    assert error.error.data["audit_id"] == "42"
+    assert writer.events == [EventType.DENY_ABAC]
+
+
+async def test_missing_attribute_writes_policy_error_and_denies() -> None:
+    policy = abac_policy(["identity.region == 'eu'"])  # identity has no `region`
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+    assert writer.events == [EventType.POLICY_ERROR, EventType.DENY_ABAC]
+
+
+async def test_missing_attribute_inside_not_still_denies() -> None:
+    # §11 inversion case end-to-end: not(missing) must not evaluate to a grant.
+    policy = abac_policy(["not (identity.region == 'eu')"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+    assert writer.events == [EventType.POLICY_ERROR, EventType.DENY_ABAC]
+
+
+async def test_type_mismatch_condition_writes_policy_error_and_denies() -> None:
+    policy = abac_policy(["identity.team < 5"])  # str vs int comparison raises
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+    assert writer.events == [EventType.POLICY_ERROR, EventType.DENY_ABAC]
+
+
+async def test_context_hour_comes_from_replay_timestamp() -> None:
+    policy = abac_policy(["context.hour < 20"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    late = {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: 22 * 3600}  # 22:00 UTC
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": late})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+
+    early = {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: 14 * 3600}  # 14:00 UTC
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": early}, id=2)
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.DENY_ABAC, EventType.ALLOW]
+
+
+async def test_risk_condition_is_evaluated_after_scoring() -> None:
+    policy = abac_policy(["risk.score < 20"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy, risk=FakeRisk(35))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    data = outcome.message.message.root.error.data
+    assert data["event_type"] == "DENY_ABAC"
+    assert data["risk_score"] == 35  # the deferred deny carries the computed score
+    assert writer.events == [EventType.DENY_ABAC]
+
+
+async def test_risk_condition_deny_wins_over_challenge_and_approval() -> None:
+    """User-confirmed precedence: deferred ABAC runs before the threshold mapping,
+    so a score that would CHALLENGE/HUMAN_APPROVAL_REQUIRED still lands DENY_ABAC."""
+    policy = abac_policy(["risk.score < 60"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy, risk=FakeRisk(75))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+    assert writer.events == [EventType.DENY_ABAC]  # not HUMAN_APPROVAL_REQUIRED
+
+
+async def test_redemption_skips_risk_conditions_but_not_stage_4() -> None:
+    """An approved retry has no fresh score: risk.* conditions are skipped by design
+    (a human approved that exact call); non-risk conditions still apply."""
+    policy = abac_policy(["identity.team == 'engineering'", "risk.score < 20"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy, risk=FakeRisk(91))
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "hi"},
+                "_meta": {**fresh_meta(), APPROVAL_META_KEY: "approval-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]
+
+    # Same retry shape, but with a failing stage-4 condition: still denied.
+    policy = abac_policy(["identity.team == 'sales'", "risk.score < 20"])
+    interceptor, writer, _, _ = make_interceptor(policy=policy, risk=FakeRisk(91))
+    outcome = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {
+                "name": "echo",
+                "arguments": {"text": "hi"},
+                "_meta": {**fresh_meta(), APPROVAL_META_KEY: "approval-1"},
+            },
+        )
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_ABAC"
+    assert writer.events == [EventType.DENY_ABAC]
 
 
 # --- Risk Engine stage 6 (item 16) ---

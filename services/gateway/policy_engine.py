@@ -1,9 +1,12 @@
-"""Loads the YAML policy, validates it, answers RBAC questions (ARCHITECTURE.md §4.8).
+"""Loads the YAML policy, validates it, answers RBAC + ABAC questions
+(ARCHITECTURE.md §4.8).
 
-RBAC only for now: ABAC conditions are Phase 3 (item 17) and the schema rejects them
-(extra="forbid") rather than silently ignoring them. Hot-reload is item 7; versioning
-beyond the YAML `version` field is Phase 3 (item 19). A missing or invalid policy file
-fails startup — fail closed (ARCHITECTURE.md §5).
+The base grant is RBAC (allowed/denied tools per server); each grant may carry
+ABAC `conditions` (item 17), compiled at load via services.gateway.abac and
+evaluated per tools/call by the interceptor — a malformed condition fails
+validation, so startup fails and SIGHUP reload keeps last-known-good. Versioning
+beyond the YAML `version` field is Phase 3 (item 19). A missing or invalid
+policy file fails startup — fail closed (ARCHITECTURE.md §5).
 """
 
 import hashlib
@@ -12,7 +15,9 @@ from typing import Literal
 
 import structlog
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
+
+from services.gateway import abac
 
 logger = structlog.get_logger(__name__)
 
@@ -37,6 +42,18 @@ class ServerGrant(BaseModel):
     server_id: str
     allowed_tools: list[str] = []
     denied_tools: list[str] = []
+    # ABAC conditions (item 17): ALL must be satisfied once RBAC matches this grant.
+    conditions: list[str] = []
+    _compiled: list[abac.Condition] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _compile_conditions(self) -> "ServerGrant":
+        self._compiled = [abac.compile_condition(source) for source in self.conditions]
+        return self
+
+    @property
+    def compiled_conditions(self) -> list[abac.Condition]:
+        return self._compiled
 
 
 class Identity(BaseModel):
@@ -47,6 +64,8 @@ class Identity(BaseModel):
     # Grants access to /admin endpoints (drift re-approval, and Phase 3's admin API).
     admin: bool = False
     allowed_servers: list[ServerGrant] = []
+    # identity.* attributes for ABAC conditions (identity.id comes from `id` itself).
+    attributes: dict[str, str | int | float | bool] = {}
 
 
 class PolicyFile(BaseModel):
@@ -75,22 +94,32 @@ class PolicyEngine:
         identity = self._identities.get(identity_id)
         return identity is not None and identity.admin
 
+    def identity(self, identity_id: str) -> Identity | None:
+        return self._identities.get(identity_id)
+
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:
+        return self.matching_grant(identity_id, server_id, tool_name) is not None
+
+    def matching_grant(
+        self, identity_id: str | None, server_id: str, tool_name: str
+    ) -> ServerGrant | None:
         """RBAC resolution: unknown/missing identity denies; a grant matches by exact
-        server_id or "*"; denied_tools overrides allowed_tools; "*" allows any tool."""
+        server_id or "*"; denied_tools overrides allowed_tools; "*" allows any tool.
+        Returns the first allowing grant — its `conditions` are the ABAC layer the
+        interceptor enforces on top (item 17)."""
         if identity_id is None:
-            return False
+            return None
         identity = self._identities.get(identity_id)
         if identity is None:
-            return False
+            return None
         for grant in identity.allowed_servers:
             if grant.server_id not in (server_id, "*"):
                 continue
             if tool_name in grant.denied_tools:
-                return False
+                return None
             if "*" in grant.allowed_tools or tool_name in grant.allowed_tools:
-                return True
-        return False
+                return grant
+        return None
 
 
 def load(path: str | Path) -> PolicyEngine:

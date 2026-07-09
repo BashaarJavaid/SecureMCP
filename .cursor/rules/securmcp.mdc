@@ -49,7 +49,7 @@ This rule file (`index.mdc`) is the only thing that loads automatically on every
 
 ## Current phase
 
-See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — item 16 (Risk Engine v1 + risk decay + human-approval lifecycle) is done. Next is item 17: ABAC conditions layered onto the policy engine (embedded expression evaluator; explicitly no loops/recursion/arbitrary code; missing-attribute references evaluate the whole condition as not-satisfied, never injected as a raw boolean into a `not`).
+See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — items 16 (Risk Engine v1 + risk decay + human-approval lifecycle) and 17 (ABAC conditions: load-time-compiled boolean expressions on ServerGrants, `services/gateway/abac.py`) are done. Next is item 18: richer risk telemetry — prior-denial-rate, drift-history, and an auth-failure counter added to the Auth Layer.
 
 ---
 

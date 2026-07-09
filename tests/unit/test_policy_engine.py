@@ -1,4 +1,4 @@
-"""ARCHITECTURE.md §11 unit criterion: policy resolution logic (RBAC)."""
+"""ARCHITECTURE.md §11 unit criterion: policy resolution logic (RBAC + ABAC load)."""
 
 from pathlib import Path
 
@@ -60,7 +60,38 @@ def test_denied_tools_overrides_wildcard_allow() -> None:
     assert not engine.is_allowed("ops", "github", "delete_repo")
 
 
-def test_conditions_key_is_rejected_until_phase_3(tmp_path: Path) -> None:
+def test_conditions_are_compiled_at_load(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(
+        """
+version: 1
+identities:
+  - id: "ops"
+    api_key_hash: "sha256:1"
+    attributes:
+      team: "engineering"
+    allowed_servers:
+      - server_id: "*"
+        allowed_tools: ["*"]
+        conditions:
+          - "identity.team == 'engineering' and context.hour < 20"
+          - "risk.score < 60"
+"""
+    )
+    engine = policy_engine.load(policy)
+    grant = engine.matching_grant("ops", "github", "merge_pr")
+    assert grant is not None
+    compiled = grant.compiled_conditions
+    assert [c.source for c in compiled] == [
+        "identity.team == 'engineering' and context.hour < 20",
+        "risk.score < 60",
+    ]
+    assert [c.references_risk for c in compiled] == [False, True]
+    assert engine.identity("ops") is not None
+    assert engine.identity("ops").attributes == {"team": "engineering"}  # type: ignore[union-attr]
+
+
+def test_malformed_condition_fails_load(tmp_path: Path) -> None:
     policy = tmp_path / "policy.yaml"
     policy.write_text(
         """
@@ -72,11 +103,17 @@ identities:
       - server_id: "*"
         allowed_tools: ["*"]
         conditions:
-          - "risk.score < 60"
+          - "__import__('os').system('id')"
 """
     )
     with pytest.raises(ValidationError):
         policy_engine.load(policy)
+
+
+def test_matching_grant_none_when_rbac_denies() -> None:
+    engine = make_engine([READONLY])
+    assert engine.matching_grant("agent-readonly", "github", "merge_pr") is None
+    assert engine.matching_grant("nobody", "github", "list_issues") is None
 
 
 def test_missing_policy_file_raises(tmp_path: Path) -> None:
@@ -104,3 +141,25 @@ def test_policy_store_keeps_last_known_good_on_broken_reload(tmp_path: Path) -> 
     path.write_text("version: [broken\n")
     assert store.reload() is False
     assert store.engine.version == 1  # old policy stays active
+
+
+def test_policy_store_keeps_last_known_good_on_bad_condition(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("version: 1\nidentities: []\n")
+    store = policy_engine.PolicyStore(path)
+
+    path.write_text(
+        """
+version: 2
+identities:
+  - id: "ops"
+    api_key_hash: "sha256:1"
+    allowed_servers:
+      - server_id: "*"
+        allowed_tools: ["*"]
+        conditions:
+          - "open('/etc/passwd')"
+"""
+    )
+    assert store.reload() is False
+    assert store.engine.version == 1
