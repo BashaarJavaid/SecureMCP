@@ -135,10 +135,15 @@ async def explain_call(
     detector: DriftDetector,
     risk: RiskEngine,
     schema_cache: SchemaCache,
+    validate_params: bool = True,
 ) -> Decision:
     """Dry-run the §4.2 pipeline (minus replay, minus all side effects) for a
     hypothetical call against the current policy. Always returns a Decision with
-    audit_id=None; never raises for a policy outcome."""
+    audit_id=None; never raises for a policy outcome.
+
+    validate_params=False skips stage 7 entirely (item 21): tool schemas aren't
+    part of the policy, so Policy Simulation replays the pure policy pipeline
+    without schema-cache state leaking into the comparison."""
 
     def decide(
         outcome: DecisionOutcome,
@@ -303,6 +308,16 @@ async def explain_call(
             EventType.DENY_VALIDATION,
             f"invalid arguments for {tool_name!r}: {detail}",
             ["param_validator"],
+            risk_score=risk_score,
+            risk_factors=risk_factors,
+        )
+
+    if not validate_params:
+        return decide(
+            DecisionOutcome.ALLOW,
+            EventType.ALLOW,
+            f"call to {tool_name!r} would be allowed",
+            [f"policy-v{engine.version}:rbac"],
             risk_score=risk_score,
             risk_factors=risk_factors,
         )

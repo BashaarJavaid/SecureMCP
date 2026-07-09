@@ -140,6 +140,7 @@ class Interceptor:
     ) -> Forward | Respond:
         params = request.params or {}
         tool_name = str(params.get("name", ""))
+        arguments = params.get("arguments", {}) or {}
 
         # Replay Guard (§4.2 stage 1, cheapest check first): nonce + timestamp from
         # params._meta; missing/invalid fields and a Redis failure all deny (§5).
@@ -158,11 +159,12 @@ class Interceptor:
                 EventType.DENY_REPLAY,
                 f"Replay detected: {replay_reason}",
                 ["replay_guard"],
+                arguments=arguments,
             )
 
         grant = self.engine.matching_grant(self.identity_id, settings.upstream_server_id, tool_name)
         if grant is None:
-            return await self._deny_rbac(request, tool_name)
+            return await self._deny_rbac(request, tool_name, arguments)
 
         # ABAC conditions (§4.2 stage 4): ALL conditions on the RBAC-matched grant
         # must hold. Conditions referencing risk.* are deferred until a score exists
@@ -170,7 +172,11 @@ class Interceptor:
         conditions = grant.compiled_conditions
         abac_attrs = self._abac_attributes(tool_name, meta) if conditions else {}
         denied = await self._enforce_conditions(
-            request, tool_name, [c for c in conditions if not c.references_risk], abac_attrs
+            request,
+            tool_name,
+            arguments,
+            [c for c in conditions if not c.references_risk],
+            abac_attrs,
         )
         if denied is not None:
             return denied
@@ -190,12 +196,12 @@ class Interceptor:
                 f"{tool_name!r} is blocked: schema drifted from its approved baseline"
                 " and is pending re-approval",
                 ["drift_detector"],
+                arguments=arguments,
             )
 
         # Risk Engine (§4.2 stage 6, before param validation). A retry carrying an
         # approval id redeems it instead of re-scoring: a human reviewed this exact
         # call (§4.8); RBAC/drift/replay above and param validation below still apply.
-        arguments = params.get("arguments", {}) or {}
         approval_id = meta.get(APPROVAL_META_KEY)
         risk_score: int | None = None
         risk_factors: list[RiskFactor] | None = None
@@ -210,7 +216,12 @@ class Interceptor:
             if denial is not None:
                 event_type, reason = denial
                 return await self._deny(
-                    request, tool_name, event_type, reason, ["approval_lifecycle"]
+                    request,
+                    tool_name,
+                    event_type,
+                    reason,
+                    ["approval_lifecycle"],
+                    arguments=arguments,
                 )
         else:
             try:
@@ -238,6 +249,7 @@ class Interceptor:
             denied = await self._enforce_conditions(
                 request,
                 tool_name,
+                arguments,
                 [c for c in conditions if c.references_risk],
                 abac_attrs,
                 risk_score=risk_score,
@@ -255,11 +267,11 @@ class Interceptor:
         input_schema = await self._input_schema_for(tool_name)
         if input_schema is None:
             return await self._deny_validation(
-                request, tool_name, "tool schema unavailable from upstream"
+                request, tool_name, arguments, "tool schema unavailable from upstream"
             )
         error = param_validator.validate(arguments, input_schema)
         if error is not None:
-            return await self._deny_validation(request, tool_name, error)
+            return await self._deny_validation(request, tool_name, arguments, error)
         arguments, sanitized_fields = param_validator.sanitize(arguments)
         params["arguments"] = arguments
 
@@ -326,6 +338,7 @@ class Interceptor:
         self,
         request: JSONRPCRequest,
         tool_name: str,
+        arguments: dict[str, Any],
         conditions: list[abac.Condition],
         attrs: dict[str, abac.AttrValue],
         risk_score: int | None = None,
@@ -370,6 +383,7 @@ class Interceptor:
                     [f"policy-v{self.engine.version}:abac:{condition.source}"],
                     risk_score=risk_score,
                     risk_factors=risk_factors,
+                    arguments=arguments,
                 )
         return None
 
@@ -415,9 +429,12 @@ class Interceptor:
         matched_rules: list[str],
         risk_score: int | None = None,
         risk_factors: list[RiskFactor] | None = None,
+        arguments: dict[str, Any] | None = None,
     ) -> Respond:
         """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
-        row seq as audit_id. The deny stands even if the audit write fails."""
+        row seq as audit_id. The deny stands even if the audit write fails.
+        arguments (raw, pre-sanitize) land in the payload so Policy Simulation can
+        replay denied calls too (item 21); rows written before then lack them."""
         self._pending.pop(request.id, None)
         try:
             # Prior-denial-rate telemetry (§4.8, item 18): best-effort — a counting
@@ -438,6 +455,8 @@ class Interceptor:
             "reason": decision.reason,
             "matched_rules": matched_rules,
         }
+        if arguments is not None:
+            payload_extra["arguments"] = arguments
         if risk_factors:
             payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         try:
@@ -488,6 +507,7 @@ class Interceptor:
                 ["risk_engine"],
                 risk_score=risk_score,
                 risk_factors=risk_factors,
+                arguments=arguments,
             )
         self._pending.pop(request.id, None)
         if risk_score >= 70:
@@ -520,6 +540,7 @@ class Interceptor:
                 payload_extra={
                     "reason": reason,
                     "matched_rules": decision.matched_rules,
+                    "arguments": arguments,
                     "risk_factors": [f.model_dump(mode="json") for f in risk_factors],
                 },
                 risk_score=risk_score,
@@ -555,7 +576,7 @@ class Interceptor:
         )
 
     async def _deny_validation(
-        self, request: JSONRPCRequest, tool_name: str, reason: str
+        self, request: JSONRPCRequest, tool_name: str, arguments: dict[str, Any], reason: str
     ) -> Respond:
         return await self._deny(
             request,
@@ -563,15 +584,19 @@ class Interceptor:
             EventType.DENY_VALIDATION,
             f"invalid arguments for {tool_name!r}: {reason}",
             ["param_validator"],
+            arguments=arguments,
         )
 
-    async def _deny_rbac(self, request: JSONRPCRequest, tool_name: str) -> Respond:
+    async def _deny_rbac(
+        self, request: JSONRPCRequest, tool_name: str, arguments: dict[str, Any]
+    ) -> Respond:
         return await self._deny(
             request,
             tool_name,
             EventType.DENY_RBAC,
             f"identity {self.identity_id!r} is not authorized to call {tool_name!r}",
             [f"policy-v{self.engine.version}:rbac"],
+            arguments=arguments,
         )
 
     async def on_upstream_message(self, message: SessionMessage) -> SessionMessage | None:

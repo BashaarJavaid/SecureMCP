@@ -19,6 +19,7 @@ from services.gateway import (
     decision_explainer,
     logging_config,
     policy_engine,
+    policy_simulator,
     policy_versions,
     signing,
 )
@@ -310,6 +311,47 @@ async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, 
         schema_cache=SchemaCache(request.app.state.redis),
     )
     return decision.model_dump(mode="json")
+
+
+@app.post("/admin/policy/simulate")
+async def simulate_policy(
+    body: policy_simulator.SimulateRequest, request: Request
+) -> dict[str, object]:
+    """Policy Simulation Mode (§4.8, item 21): replay historical decisions against
+    a candidate revision (candidate_version) or diff two revisions
+    (compare_versions) — read-only, nothing is activated and nothing is audited."""
+    await _require_admin(request)
+    if (body.candidate_version is None) == (body.compare_versions is None):
+        raise HTTPException(
+            status_code=400,
+            detail="exactly one of candidate_version or compare_versions is required",
+        )
+    if body.compare_versions is not None and len(body.compare_versions) != 2:
+        raise HTTPException(status_code=400, detail="compare_versions must be exactly 2 versions")
+    deps: dict[str, Any] = {
+        "sessionmaker": async_session,
+        "detector": request.app.state.drift_detector,
+        "risk": request.app.state.risk_engine,
+        "schema_cache": SchemaCache(request.app.state.redis),
+    }
+    try:
+        result: policy_simulator.HistoricalSimulation | policy_simulator.CompareSimulation
+        if body.candidate_version is not None:
+            result = await policy_simulator.simulate_historical(
+                body.candidate_version, body.replay_window, **deps
+            )
+        else:
+            assert body.compare_versions is not None
+            result = await policy_simulator.simulate_compare(
+                body.compare_versions, body.replay_window, **deps
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except policy_versions.ActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result.model_dump(mode="json")
 
 
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
