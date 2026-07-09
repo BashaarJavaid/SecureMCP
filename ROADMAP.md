@@ -45,4 +45,3 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for what each item actually means and
 28. README finalized: architecture diagrams, threat model table, real (not estimated) benchmark numbers, demo GIF/recording of the full narrative, explicit roadmap section.
 29. Documented-only roadmap for anything not built: OAuth 2.1 On-Behalf-Of token exchange, OPA/Cedar integration if policy complexity outgrows the embedded evaluator, a real step-up auth challenge flow, an admin UI, two-person policy activation approval for the insider-admin threat gap, and multi-server trust scoring.
 30. ~~Deferred: split this single spec into separate files~~ — **done as of this revision**: split into `README.md`, `ARCHITECTURE.md`, `THREAT_MODEL.md`, `docs/adr/*.md`, and `ROADMAP.md`.
-
