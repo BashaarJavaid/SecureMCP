@@ -8,7 +8,7 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, e
 
 This README is intentionally short. Deeper detail lives in dedicated files so an AI coding agent (or a human) only loads what's relevant to the task at hand, rather than the entire design on every session:
 
-- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — core architecture, decision pipeline, all components, failure modes, security hardening, observability, cache invalidation, performance benchmarks, scalability, testing strategy, CI/CD, deployment
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — core architecture, decision pipeline, all components, failure modes, security hardening, observability, cache invalidation, performance benchmarks, scalability, testing strategy, CI/CD, deployment; component/deployment/data-flow diagrams live in §4.4–§4.7
 - [`THREAT_MODEL.md`](./THREAT_MODEL.md) — what's protected against, what isn't, and the assumptions the whole model rests on
 - [`docs/adr/`](./docs/adr/) — one file per consequential architecture decision, including why several common alternatives (Envoy, OPA, Kong, NGINX, sidecars, client-SDK middleware) weren't chosen for v1
 - [`ROADMAP.md`](./ROADMAP.md) — the four-phase build order, kept as a living checklist
