@@ -100,6 +100,7 @@ async def preflight_clean() -> None:
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
             await conn.execute(text("TRUNCATE tool_baselines"))
             await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
+            await conn.execute(text("TRUNCATE policy_versions"))
     except Exception:
         sys.exit(f"postgres not reachable — {remedy}")
 

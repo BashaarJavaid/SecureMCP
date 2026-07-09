@@ -4,9 +4,10 @@
 The base grant is RBAC (allowed/denied tools per server); each grant may carry
 ABAC `conditions` (item 17), compiled at load via services.gateway.abac and
 evaluated per tools/call by the interceptor — a malformed condition fails
-validation, so startup fails and SIGHUP reload keeps last-known-good. Versioning
-beyond the YAML `version` field is Phase 3 (item 19). A missing or invalid
-policy file fails startup — fail closed (ARCHITECTURE.md §5).
+validation, so startup fails and SIGHUP reload keeps last-known-good. Activation
+record-keeping (revision snapshots, policy_versions rows, monotonicity — item 19)
+lives in services.gateway.policy_versions. A missing or invalid policy file fails
+startup — fail closed (ARCHITECTURE.md §5).
 """
 
 import hashlib
@@ -77,9 +78,12 @@ class PolicyFile(BaseModel):
 
 
 class PolicyEngine:
-    def __init__(self, policy: PolicyFile, content_hash: str = "") -> None:
+    def __init__(self, policy: PolicyFile, content_hash: str = "", raw: bytes = b"") -> None:
         self.policy = policy
         self.content_hash = content_hash
+        # Exact file bytes, snapshotted verbatim on activation (item 19) — never
+        # re-serialized through yaml.dump, which would change formatting.
+        self.raw = raw
         self._identities = {identity.id: identity for identity in policy.identities}
         self._by_key_hash = {identity.api_key_hash: identity.id for identity in policy.identities}
 
@@ -122,12 +126,15 @@ class PolicyEngine:
         return None
 
 
-def load(path: str | Path) -> PolicyEngine:
-    raw = Path(path).read_bytes()
+def load_bytes(raw: bytes) -> PolicyEngine:
     data = yaml.safe_load(raw)
     return PolicyEngine(
-        PolicyFile.model_validate(data), content_hash=hashlib.sha256(raw).hexdigest()
+        PolicyFile.model_validate(data), content_hash=hashlib.sha256(raw).hexdigest(), raw=raw
     )
+
+
+def load(path: str | Path) -> PolicyEngine:
+    return load_bytes(Path(path).read_bytes())
 
 
 class PolicyStore:
@@ -139,13 +146,26 @@ class PolicyStore:
         self._path = Path(path)
         self.engine = load(self._path)
 
-    def reload(self) -> bool:
-        """Swap in the file's current contents; keep last-known-good on any error —
-        a broken reload must not take the gateway down or weaken the active policy."""
+    def load_candidate(self) -> PolicyEngine | None:
+        """Parse + validate the file's current contents without swapping; None on any
+        error — a broken reload must not take the gateway down or weaken the active
+        policy (last-known-good, item 7). The caller records the activation (item 19)
+        before calling swap()."""
         try:
-            self.engine = load(self._path)
+            return load(self._path)
         except Exception:
             logger.exception("policy_reload_failed_keeping_last_known_good")
+            return None
+
+    def swap(self, engine: PolicyEngine) -> None:
+        self.engine = engine
+        logger.info("policy_activated", version=engine.version)
+
+    def reload(self) -> bool:
+        """Load + swap in one step; keep last-known-good on any error. The gateway's
+        SIGHUP path uses load_candidate()/swap() around activation record-keeping."""
+        candidate = self.load_candidate()
+        if candidate is None:
             return False
-        logger.info("policy_reloaded", version=self.engine.version)
+        self.swap(candidate)
         return True

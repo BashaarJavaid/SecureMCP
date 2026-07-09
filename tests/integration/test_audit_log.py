@@ -54,13 +54,21 @@ async def test_decision_points_write_chained_rows(gateway: Gateway) -> None:
     await drive_session(gateway)
     rows = await fetch_rows()
 
-    assert [r.event_type for r in rows] == ["SESSION_START", "TOOLS_LIST", "ALLOW", "DENY_RBAC"]
-    assert all(r.identity_id == "agent-readonly" for r in rows)
+    # Row 0 is the boot-time activation (item 19); the session's rows follow.
+    assert [r.event_type for r in rows] == [
+        "POLICY_ACTIVATED",
+        "SESSION_START",
+        "TOOLS_LIST",
+        "ALLOW",
+        "DENY_RBAC",
+    ]
+    assert rows[0].identity_id == "startup"
+    assert all(r.identity_id == "agent-readonly" for r in rows[1:])
     assert all(r.policy_version == 1 for r in rows)
-    assert rows[2].tool_name == "echo"
-    assert rows[3].tool_name == "add"
-    assert rows[1].payload["served_tools"] == ["echo"]
-    assert rows[1].payload["pruned_tools"] == ["add"]
+    assert rows[3].tool_name == "echo"
+    assert rows[4].tool_name == "add"
+    assert rows[2].payload["served_tools"] == ["echo"]
+    assert rows[2].payload["pruned_tools"] == ["add"]
 
     assert rows[0].prev_hash == GENESIS_HASH
     for prev, row in zip(rows, rows[1:], strict=False):

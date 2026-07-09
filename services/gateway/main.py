@@ -12,7 +12,7 @@ from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth, logging_config, signing
+from services.gateway import auth, logging_config, policy_engine, policy_versions, signing
 from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
@@ -33,8 +33,17 @@ KEY_HEADER = "x-securmcp-key"
 
 async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
     old_version = store.engine.version
-    if not store.reload():
+    candidate = store.load_candidate()
+    if candidate is None:
         return  # last-known-good stays active; failure already logged
+    try:
+        # Record before swap (item 19): a rejected or unrecordable activation keeps
+        # last-known-good (§5 fail-closed).
+        await policy_versions.record_activation(candidate, "operator", async_session)
+    except Exception:
+        logger.exception("policy_activation_rejected_keeping_last_known_good")
+        return
+    store.swap(candidate)
     try:
         await writer.write(
             EventType.POLICY_ACTIVATED,
@@ -59,6 +68,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
     writer = AuditWriter(redis_client, async_session, store, signing_key)
+    app.state.audit_writer = writer  # rollback endpoint (item 19)
+    # Record + audit the boot-time activation (item 19). A monotonicity conflict
+    # (e.g. same version, different content) fails startup; the snapshot/row are
+    # idempotent on a re-seen version but the audit row is unconditional, so every
+    # boot's active policy — including one reverting a rollback — is in the chain.
+    await policy_versions.record_activation(store.engine, "startup", async_session)
+    await writer.write(
+        EventType.POLICY_ACTIVATED,
+        "startup",
+        payload_extra={
+            "old_version": None,
+            "new_version": store.engine.version,
+            "content_hash": store.engine.content_hash,
+        },
+    )
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
     risk_engine = RiskEngine(redis_client, detector)
@@ -161,6 +185,64 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
         policy_version=store.engine.version,
         audit_id=str(seq),
         approval_id=approval_id,
+    )
+    return decision.model_dump(mode="json")
+
+
+@app.post("/admin/policy/rollback/{version}")
+async def rollback_policy(version: int, request: Request) -> dict[str, object]:
+    """Re-activate a prior policy revision (§4.8, item 19): loads the append-only
+    snapshot, verifies it against the recorded content_hash, swaps the in-memory
+    PolicyStore, and refreshes the policy_versions row. In-memory only — POLICY_FILE
+    on disk is mounted read-only and keeps the newer version until the operator
+    updates it; a restart re-activates whatever is on disk (audited)."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    snapshot = policy_versions.snapshot_path(version)
+    if not snapshot.exists():
+        raise HTTPException(status_code=404, detail=f"no revision snapshot for v{version}")
+    try:
+        engine = policy_engine.load_bytes(snapshot.read_bytes())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"revision v{version} is invalid") from exc
+    try:
+        await policy_versions.record_rollback(engine, identity_id, async_session)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except policy_versions.ActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    old_version = store.engine.version
+    writer: AuditWriter = request.app.state.audit_writer
+    seq = await writer.write(
+        EventType.POLICY_ACTIVATED,
+        identity_id,
+        payload_extra={
+            "old_version": old_version,
+            "new_version": engine.version,
+            "content_hash": engine.content_hash,
+            "rollback": True,
+        },
+    )
+    store.swap(engine)
+    logger.warning(
+        "policy_rolled_back_in_memory_only",
+        old_version=old_version,
+        new_version=engine.version,
+        hint="POLICY_FILE on disk still holds the newer version; update it or a restart reverts",
+    )
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.POLICY_ACTIVATED,
+        reason=f"policy rolled back from v{old_version} to v{engine.version} by {identity_id!r}",
+        matched_rules=["admin_rollback"],
+        policy_version=engine.version,
+        audit_id=str(seq),
     )
     return decision.model_dump(mode="json")
 

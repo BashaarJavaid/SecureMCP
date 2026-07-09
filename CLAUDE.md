@@ -39,6 +39,8 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 - `.venv/bin/ruff format --check .` — formatting (CI-enforced; fix with `ruff format .`)
 - `.venv/bin/mypy services/` — strict type-check
 - `.venv/bin/python scripts/verify_audit_chain.py` — walk and verify the audit hash chain (+ signatures when the public key is present)
+- `.venv/bin/python scripts/verify_audit_chain.py --diff-policy v3 v4 [--html]` — diff two policy revision snapshots from `policies/revisions/` (no DB needed); `--html` writes a side-by-side `policy-diff-v3-v4.html` (stdlib `difflib.HtmlDiff`)
+- `curl -X POST localhost:8000/admin/policy/rollback/<n> -H "X-SecurMCP-Key: <admin key>"` — re-activate a prior policy revision in memory (POLICY_FILE on disk keeps the newer version until the operator updates it; a restart reverts, audited)
 - `.venv/bin/python scripts/audit_verifier_daemon.py [--once]` — incremental checkpointed verification (the compose `verifier` sidecar runs this on a loop)
 - `.venv/bin/python -m tests.benchmarks.run [N]` — performance benchmark suite (default N=1000 calls/scenario); needs postgres + redis up (`docker compose up -d postgres redis`) and wipes the dev audit chain like the integration tests do; reports land in gitignored `tests/benchmarks/reports/`
 - `python scripts/run_demo.py` then `POLICY_FILE=policies/demo-policy.yaml UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" docker compose up -d --build`, then `curl -X POST localhost:9800/_admin/apply_mutation` when prompted — the pruning + drift-blocking demo (resets the dev audit chain/baselines at start)
@@ -46,7 +48,7 @@ Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelat
 
 ## Current phase
 
-See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — items 16 (Risk Engine v1 + risk decay + human-approval lifecycle), 17 (ABAC conditions: load-time-compiled boolean expressions on ServerGrants, `services/gateway/abac.py`), and 18 (richer risk telemetry: prior-denial-rate, drift-history, gateway-wide auth-failure counter) are done. Next is item 19: policy versioning (version stamping, revision snapshots, rollback) plus the `--diff-policy` terminal mode and `--html` side-by-side diff flag.
+See `ROADMAP.md`. Phases 1 and 2 are complete (items 1–15); Phase 3 is underway — items 16 (Risk Engine v1 + risk decay + human-approval lifecycle), 17 (ABAC conditions, `services/gateway/abac.py`), 18 (richer risk telemetry), and 19 (policy versioning: activation snapshots + `policy_versions` rows via `services/gateway/policy_versions.py`, monotonic version stamping, admin rollback endpoint, `--diff-policy`/`--html` on `verify_audit_chain.py`) are done. Next is item 20: the Decision Explanation API (`GET /admin/decisions/{id}`, `POST /admin/decisions/explain`).
 
 ---
 

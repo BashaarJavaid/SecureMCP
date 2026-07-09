@@ -114,8 +114,13 @@ async def reset_dev_state() -> None:
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
             await conn.execute(text("TRUNCATE tool_baselines"))
             await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
+            await conn.execute(text("TRUNCATE policy_versions"))
     except Exception:
         sys.exit("postgres not reachable — run: docker compose up -d postgres")
+    # Each demo run re-mints keys into the same policy version number; stale revision
+    # snapshots would collide with the fresh content (item 19's append-only check).
+    for snapshot in Path(settings.policy_revisions_dir).glob("v*.yaml"):
+        snapshot.unlink()
 
 
 @asynccontextmanager
