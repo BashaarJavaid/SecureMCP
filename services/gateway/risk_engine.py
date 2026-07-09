@@ -30,7 +30,7 @@ import redis.asyncio as aioredis
 
 from services.gateway import auth
 from services.gateway.config import settings
-from services.gateway.decision import RiskFactor
+from services.gateway.decision import DecisionOutcome, RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import RiskPolicy
 
@@ -205,6 +205,20 @@ def _denial_key(identity_id: str) -> str:
     return f"risk:denials:{identity_id}"
 
 
+def threshold_outcome(score: int) -> DecisionOutcome:
+    """The §4.8 threshold bands as a pure mapping: <40 continue (allow), 40-69
+    CHALLENGE, 70-90 HUMAN_APPROVAL_REQUIRED, >90 DENY. The interceptor keeps its
+    own inline branches (it also picks event types and reasons); this exists for
+    the Decision Explanation API (item 20) and its `alternative` field."""
+    if score > 90:
+        return DecisionOutcome.DENY
+    if score >= 70:
+        return DecisionOutcome.HUMAN_APPROVAL_REQUIRED
+    if score >= 40:
+        return DecisionOutcome.CHALLENGE
+    return DecisionOutcome.ALLOW
+
+
 def combine(factors: list[RiskFactor], decay_offset: int) -> int:
     """Weighted sum with the decay boundary: the offset discounts only the behavioral
     subtotal, floored at 0, and the total is clamped to 0-100."""
@@ -224,16 +238,23 @@ class RiskEngine:
         tool_name: str,
         arguments: dict[str, Any],
         risk_policy: RiskPolicy,
+        dry_run: bool = False,
     ) -> tuple[int, list[RiskFactor]]:
         """Score one prospective call. Raises on Redis/Postgres failure — callers
-        treat that as score 100 and deny (§5)."""
+        treat that as score 100 and deny (§5). dry_run (item 20 explain) predicts
+        what a live call would score — the frequency counter is read + 1 instead
+        of INCRed, so explaining never mutates telemetry."""
+        if dry_run:
+            call_count = await self._counter(_freq_key(identity_id, tool_name)) + 1
+        else:
+            call_count = await self._bump_frequency(identity_id, tool_name)
         ctx = RiskContext(
             identity_id=identity_id,
             tool_name=tool_name,
             arguments=arguments,
             policy=risk_policy,
             now=datetime.now(UTC),
-            call_count=await self._bump_frequency(identity_id, tool_name),
+            call_count=call_count,
             drift_in_review=await self._detector.has_pending_drift(
                 settings.upstream_server_id, tool_name
             ),

@@ -192,7 +192,7 @@ Recording script — a single continuous story rather than a feature checklist:
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
 
-As of Phase 2, steps 1–2, the drift-blocking half of 3, the approval in 4 (via `POST /admin/tools/{server}/{tool}/approve` — the Decision Explanation endpoint is Phase 3), 5, and 6 are live and driven by `scripts/run_demo.py`; the Risk Engine flag in step 3 and the simulation in step 7 land with Phase 3.
+As of Phase 3 (items 16–20), steps 1–6 are fully live — including the Risk Engine flag in step 3 and step 4's `GET /admin/decisions/{id}` Decision Explanation endpoint; `scripts/run_demo.py` drives the pruning + drift-blocking arc, and only the simulation in step 7 remains (Phase 3, item 21).
 
 ---
 

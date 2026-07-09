@@ -4,19 +4,28 @@ import asyncio
 import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+from pydantic import BaseModel
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth, logging_config, policy_engine, policy_versions, signing
+from services.gateway import (
+    auth,
+    decision_explainer,
+    logging_config,
+    policy_engine,
+    policy_versions,
+    signing,
+)
 from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
-from services.gateway.db import async_session
+from services.gateway.db import AuditLog, async_session
 from services.gateway.decision import Decision, DecisionOutcome, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyStore
@@ -243,6 +252,62 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
         matched_rules=["admin_rollback"],
         policy_version=engine.version,
         audit_id=str(seq),
+    )
+    return decision.model_dump(mode="json")
+
+
+async def _require_admin(request: Request) -> str:
+    """Shared /admin/* auth (item 20 endpoints): key resolves to an admin identity."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    return identity_id
+
+
+@app.get("/admin/decisions/{seq}")
+async def get_decision(seq: int, request: Request) -> dict[str, object]:
+    """Decision Explanation, historical entry point (§4.8, item 20): reconstruct the
+    canonical Decision an audit row recorded. {seq} is the audit_log seq — the same
+    value clients receive as Decision.audit_id. Non-decision rows are 404."""
+    await _require_admin(request)
+    async with async_session() as session:
+        row = await session.get(AuditLog, seq)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no audit row {seq}")
+    try:
+        decision = decision_explainer.from_audit_row(row)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return decision.model_dump(mode="json")
+
+
+class ExplainRequest(BaseModel):
+    identity: str
+    tool: str
+    arguments: dict[str, Any] = {}
+    context: dict[str, Any] = {}
+
+
+@app.post("/admin/decisions/explain")
+async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, object]:
+    """Decision Explanation, hypothetical entry point (§4.8, item 20): dry-run the
+    §4.2 pipeline for a would-be call against the current in-memory policy — no
+    audit rows, no approvals, no counter bumps, no upstream traffic."""
+    await _require_admin(request)
+    decision = await decision_explainer.explain_call(
+        body.identity,
+        body.tool,
+        body.arguments,
+        body.context,
+        engine=request.app.state.policy_store.engine,
+        detector=request.app.state.drift_detector,
+        risk=request.app.state.risk_engine,
+        schema_cache=SchemaCache(request.app.state.redis),
     )
     return decision.model_dump(mode="json")
 

@@ -264,7 +264,12 @@ class Interceptor:
         params["arguments"] = arguments
 
         # ALLOW is recorded before the call is forwarded — no record, no action (§5).
-        payload_extra: dict[str, object] = {"arguments": arguments}
+        # matched_rules in the payload keeps GET /admin/decisions/{seq} faithful
+        # instead of reconstructing from event_type (item 20).
+        payload_extra: dict[str, object] = {
+            "arguments": arguments,
+            "matched_rules": [f"policy-v{self.engine.version}:rbac"],
+        }
         if sanitized_fields:
             payload_extra["sanitized_fields"] = sanitized_fields
         if risk_factors:
@@ -429,7 +434,10 @@ class Interceptor:
             risk_factors=risk_factors,
             policy_version=self.engine.version,
         )
-        payload_extra: dict[str, Any] = {"reason": decision.reason}
+        payload_extra: dict[str, Any] = {
+            "reason": decision.reason,
+            "matched_rules": matched_rules,
+        }
         if risk_factors:
             payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         try:
@@ -511,6 +519,7 @@ class Interceptor:
                 tool_name=tool_name,
                 payload_extra={
                     "reason": reason,
+                    "matched_rules": decision.matched_rules,
                     "risk_factors": [f.model_dump(mode="json") for f in risk_factors],
                 },
                 risk_score=risk_score,
