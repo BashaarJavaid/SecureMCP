@@ -8,9 +8,10 @@ self-consistent but unsignable without the gateway's private key).
 
 On a break the checkpoint stops advancing at the last good row and never moves past
 it — everything downstream of a confirmed break is untrusted regardless of whether it
-individually re-verifies. Alerting is logger.error for now (structlog is item 13,
-Prometheus counters are item 25). The daemon being down never blocks live traffic
-(§5): it is a detective control, not a preventive one.
+individually re-verifies. Alerting is the structured error log plus the §7
+securmcp_audit_chain_verify_failures_total counter (item 25) — alert on any increase.
+The daemon being down never blocks live traffic (§5): it is a detective control, not
+a preventive one.
 """
 
 import structlog
@@ -18,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from services.gateway import signing
+from services.gateway import metrics, signing
 from services.gateway.audit_log import GENESIS_HASH, compute_hash
 from services.gateway.db import AuditLog, VerifierCheckpoint
 
@@ -60,6 +61,7 @@ async def verify_increment(
                 failure = f"BAD SIGNATURE at seq={row.seq}: curr_hash was not signed by the gateway"
             if failure is not None:
                 logger.error("audit_chain_verification_failed", failure=failure, seq=row.seq)
+                metrics.AUDIT_VERIFY_FAILURES.inc()
                 break
             prev_hash = row.curr_hash
             last_verified = row.seq

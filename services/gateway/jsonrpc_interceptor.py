@@ -22,6 +22,7 @@ the upstream on a miss (TTL expiry or a client that calls without listing).
 """
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -39,7 +40,7 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import abac, param_validator, schema_pruner
+from services.gateway import abac, metrics, param_validator, schema_pruner
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
@@ -130,7 +131,12 @@ class Interceptor:
             # A fresh handshake is the trust boundary to re-verify against (§8).
             await self.cache.invalidate(settings.upstream_server_id)
         elif root.method == "tools/call":
-            return await self._authorize_call(message, root)
+            # §7: decision-pipeline time only — the upstream round trip is not in here.
+            start = time.perf_counter()
+            try:
+                return await self._authorize_call(message, root)
+            finally:
+                metrics.REQUEST_LATENCY.observe(time.perf_counter() - start)
         elif root.method not in _HANDLED_METHODS:
             self._log.info("passthrough_no_handler", method=root.method)
         return Forward(message)
@@ -241,6 +247,9 @@ class Interceptor:
                         )
                     ],
                 )
+            # Every fresh score passes through here exactly once, whatever the
+            # eventual outcome — the one right place for the §7 histogram.
+            metrics.RISK_SCORE.observe(risk_score)
             # Deferred ABAC: risk.* conditions run the moment a score exists,
             # before the threshold mapping — an ABAC deny wins over CHALLENGE /
             # HUMAN_APPROVAL_REQUIRED (§4.2: stage 4 precedes stage 6). Deliberately
@@ -307,6 +316,9 @@ class Interceptor:
             tool=tool_name,
             audit_id=str(seq),
         )
+        metrics.TOOL_CALLS.labels(
+            self.identity_id, settings.upstream_server_id, tool_name, EventType.ALLOW.value
+        ).inc()
         # The nonce/timestamp/approval-id trio is gateway-facing only — never upstream.
         meta.pop(NONCE_META_KEY, None)
         meta.pop(TIMESTAMP_META_KEY, None)
@@ -479,6 +491,11 @@ class Interceptor:
             risk_score=risk_score,
             audit_id=decision.audit_id,
         )
+        metrics.TOOL_CALLS.labels(
+            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+        ).inc()
+        if event_type is EventType.DENY_REPLAY:
+            metrics.REPLAY_DENIED.inc()
         return _error(
             request.id,
             POLICY_DENIED_CODE,
@@ -568,6 +585,9 @@ class Interceptor:
             audit_id=decision.audit_id,
             approval_id=decision.approval_id,
         )
+        metrics.TOOL_CALLS.labels(
+            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+        ).inc()
         return _error(
             request.id,
             POLICY_DENIED_CODE,

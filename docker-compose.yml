@@ -60,6 +60,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS:-60}
+      METRICS_PORT: "9101"
     volumes:
       # Only the public key is read; the private key never leaves the gateway process.
       - ./secrets:/app/secrets:ro
@@ -79,6 +80,33 @@ services:
       - ./.rogue-state:/rogue-state
     ports:
       - "9800:9800"
+
+  # Observability (§7, item 25): opt-in via `docker compose --profile monitoring up -d`.
+  # Prometheus scrapes gateway:9100 / verifier:9101 over the compose network only —
+  # those ports are deliberately not published (metric labels carry identity ids and
+  # tool names); the §7 posture is unauthenticated-but-internal.
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    profiles: ["monitoring"]
+    environment:
+      # Local dev dashboard — anonymous read access, no login wall.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:

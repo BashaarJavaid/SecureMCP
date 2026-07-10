@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     risk_drift_history_threshold: int = 2
     # Human approval lifecycle (§4.8): pending approvals expire after this TTL.
     approval_ttl_seconds: int = 900
+    # Prometheus scrape port (§7, item 25) — a separate internal-only listener,
+    # never the published app port (labels carry identity ids and tool names).
+    # The verifier sidecar sets its own via METRICS_PORT in compose.
+    metrics_port: int = 9100
 
 
 settings = Settings()

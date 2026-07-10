@@ -10,6 +10,7 @@ import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+from prometheus_client import start_http_server
 from pydantic import BaseModel
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
@@ -113,6 +114,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         approval_store,
     )
     app.state.session_manager = manager
+    # §7 metrics on a separate internal-only listener — never the published app
+    # port, since labels carry identity ids and tool names (item 25).
+    metrics_server, _ = start_http_server(settings.metrics_port)
     sweep = asyncio.create_task(manager.sweep_loop())
     # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
     loop = asyncio.get_running_loop()
@@ -121,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # SIGTERM lands here via uvicorn's graceful shutdown (ARCHITECTURE.md §4.8).
+        metrics_server.shutdown()
         with suppress(ValueError):
             loop.remove_signal_handler(signal.SIGHUP)
         sweep.cancel()
