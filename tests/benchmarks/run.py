@@ -3,8 +3,10 @@
 Measures tools/call latency directly against sample_target/overscoped_server.py (stdio)
 vs. through the full gateway pipeline (replay guard → auth → RBAC → drift → param
 validation → audit write with ECDSA signing), plus concurrent-session p95 and the
-tools/list payload-size reduction from schema pruning. The Risk Engine is a Phase 3
-stub and is not exercised.
+tools/list payload-size reduction from schema pruning. The Risk Engine runs in the
+pipeline but is neutralized (see main()): off-hours and call-frequency factors would
+otherwise push the hammered read_file into the CHALLENGE band and abort the run —
+§9 measures pipeline latency, not risk verdicts.
 
 Documented choices (the §9 method leaves these open):
 - timing is time.perf_counter() around MCP client SDK calls, identical on both paths;
@@ -279,6 +281,13 @@ async def main() -> None:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 1000
     hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, hard), hard))  # 100 stdio sessions
+
+    # The in-process gateway shares this settings object: keep off-hours pushes and
+    # the deliberate read_file hammering out of the CHALLENGE band (score 45 aborts
+    # the run with McpError otherwise).
+    settings.business_hours_start_utc = 0
+    settings.business_hours_end_utc = 24
+    settings.risk_freq_threshold = 10**9
 
     await preflight_clean()
     keys = {"developer": secrets.token_urlsafe(32), "ops-admin": secrets.token_urlsafe(32)}
