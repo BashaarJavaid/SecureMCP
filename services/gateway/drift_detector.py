@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from services.gateway import metrics
 from services.gateway.audit_log import AuditWriter
 from services.gateway.db import AuditLog, ToolBaseline
 from services.gateway.decision import EventType
@@ -149,6 +150,7 @@ class DriftDetector:
                         "blocked": severity.blocks,
                     },
                 )
+                metrics.SCHEMA_DRIFT.labels(server_id, name, severity.name.lower()).inc()
                 row.observed_schema = tool
                 row.observed_hash = live_hash
                 if severity.blocks:
@@ -164,6 +166,7 @@ class DriftDetector:
                         tool_name=name,
                         payload_extra={"severity": "medium", "removed": True},
                     )
+                    metrics.SCHEMA_DRIFT.labels(server_id, name, "medium").inc()
                     row.observed_hash = REMOVED_SENTINEL
                     row.observed_schema = None
             await session.commit()
@@ -211,6 +214,7 @@ class DriftDetector:
                 "blocked": True,
             },
         )
+        metrics.SCHEMA_DRIFT.labels(server_id, name, "critical").inc()
         # Treated as a new, unapproved tool: baselined but blocked until approval.
         session.add(
             ToolBaseline(

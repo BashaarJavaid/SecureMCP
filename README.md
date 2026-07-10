@@ -112,7 +112,7 @@ The one-line version of [`THREAT_MODEL.md`](./THREAT_MODEL.md), which carries th
 | Containerization | Docker + Docker Compose (local + MVP prod), multi-stage build | Isolated subprocess execution per session |
 | Orchestration (post-MVP) | AWS ECS Fargate; Kubernetes explicitly deferred | Compose + ECS is enough to prove the system works; K8s adds ops overhead with no proportional signal for v1 |
 | IaC (post-MVP) | Terraform | Added after the gateway itself works — VPC, RDS, ElastiCache, ECS, ALB, Secrets Manager |
-| Observability (post-MVP) | Prometheus + Grafana, structured JSON logs (structlog) | structlog ships in MVP; Prometheus/Grafana added once the gateway logic is stable, not before |
+| Observability | Prometheus + Grafana (opt-in: `docker compose --profile monitoring up -d`), structured JSON logs (structlog) | Metrics on internal-only ports (labels carry identities/tools); dashboard provisioned from `monitoring/` — see `ARCHITECTURE.md` §7 |
 | Testing | pytest, pytest-asyncio, httpx test client | Unit + integration + adversarial suites; hypothesis schema fuzzing deferred (ROADMAP item 23) |
 | CI/CD | GitHub Actions | Lint (ruff), type-check (mypy strict), test, coverage gate, build; release pushes to GHCR on `v*` tags (ECR stays post-MVP) |
 | Secrets | AWS Secrets Manager / HashiCorp Vault (local: `.env` + docker secrets) | Never plaintext in repo or logs |

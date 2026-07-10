@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import structlog
+from prometheus_client import start_http_server
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -29,6 +30,9 @@ async def main() -> int:
     public_key = signing.load_public_key(settings.signing_public_key_file)
     interval = int(os.environ.get("VERIFY_INTERVAL_SECONDS", "60"))
     once = "--once" in sys.argv
+    if not once:
+        # §7 failure counter scrape point (item 25); internal-only, like the gateway's.
+        start_http_server(settings.metrics_port)
     try:
         while True:
             verified, failure = await verify_increment(async_session, public_key)

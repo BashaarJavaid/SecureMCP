@@ -493,14 +493,13 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 ## 7. Observability
 
-*Deferred to post-MVP (Phase 2) — structured logs ship from day one, Prometheus/Grafana are added once core gateway logic is stable so effort isn't split across two problems at once.*
+*Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
-- **Prometheus metrics:** `securmcp_tool_calls_total{identity, server, tool, decision}`, `securmcp_schema_drift_total{server, tool, severity}`, `securmcp_risk_score` (histogram), `securmcp_request_latency_seconds` (histogram), `securmcp_audit_chain_verify_failures_total`, `securmcp_replay_denied_total`.
-- **Grafana dashboard:** panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 proxy latency overhead vs direct upstream call.
-- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Ships in MVP regardless of the Prometheus/Grafana timeline.
-
----
-
+- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `securmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type), `securmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `securmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `securmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `securmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `securmcp_replay_denied_total`.
+- **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and docker-compose deliberately does not publish either port. Prometheus scrapes them over the compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
+- **Prometheus + Grafana containers:** opt-in via `docker compose --profile monitoring up -d` (config in `monitoring/`; Prometheus UI on 9090, Grafana on 3000 with anonymous access for local dev). The default compose stack is unchanged.
+- **Grafana dashboard** (`monitoring/grafana/dashboards/securmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
+- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Shipped in MVP regardless of the Prometheus/Grafana timeline.
 
 ---
 
