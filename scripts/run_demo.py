@@ -1,10 +1,13 @@
-"""Recorded demo driver (ROADMAP item 8: pruning; item 14 adds drift blocking).
+"""Recorded demo driver (ROADMAP item 8: pruning; item 14 adds drift blocking;
+item 28's recording adds the replay-guard and policy-simulation beats).
 
 Mints two API keys, writes policies/demo-policy.yaml (gitignored — keys never enter
-the repo), then drives the full narrative against the dockerized gateway: identity-
-scoped pruning, a successful call, an ON-SCREEN operator mutation of the rogue server
-(curl, no timer), drift classified Critical and blocked, admin re-approval, and the
-same call succeeding — finishing with the audit-log receipts.
+the repo), then drives the full README recording-script narrative against the
+dockerized gateway: identity-scoped pruning, a successful call, an ON-SCREEN operator
+mutation of the rogue server (curl, no timer), drift classified Critical and blocked,
+admin re-approval, the same call succeeding, an exact replay of that call blocked by
+the Replay Guard, and a Policy Simulation of a tightened v2 draft over the traffic
+just generated — finishing with the audit-log receipts.
 
 Run (mint the audit signing keypair once first — the gateway won't start without it):
     python scripts/generate_signing_key.py
@@ -15,6 +18,8 @@ and when prompted, in another terminal:
       docker compose up -d --build
 then, when prompted again (the rug pull, visible on screen):
     curl -X POST localhost:9800/_admin/apply_mutation
+and for the closing simulation beat (activates the v2 draft so it gets a snapshot):
+    docker kill -s HUP securemcp-gateway-1
 """
 
 import asyncio
@@ -50,7 +55,14 @@ ROOT = Path(__file__).parent.parent
 POLICY_PATH = ROOT / "policies" / "demo-policy.yaml"
 STATE_PATH = ROOT / ".rogue-state" / "state.json"
 
-RECEIPT_EVENTS = ["TOOLS_LIST", "DRIFT_CRITICAL", "DENY_DRIFT", "APPROVED"]
+RECEIPT_EVENTS = [
+    "TOOLS_LIST",
+    "DRIFT_CRITICAL",
+    "DENY_DRIFT",
+    "APPROVED",
+    "DENY_REPLAY",
+    "POLICY_ACTIVATED",
+]
 
 
 def section(title: str) -> None:
@@ -66,14 +78,18 @@ def fresh_meta() -> dict:
     return {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: time.time()}
 
 
-def write_policy(keys: dict[str, str]) -> None:
+def write_policy(
+    keys: dict[str, str],
+    version: int = 1,
+    developer_tools: list[str] | None = None,
+) -> None:
     def key_hash(identity: str) -> str:
         return f"sha256:{hashlib.sha256(keys[identity].encode()).hexdigest()}"
 
     POLICY_PATH.write_text(
         yaml.safe_dump(
             {
-                "version": 1,
+                "version": version,
                 "identities": [
                     {
                         "id": "developer",
@@ -81,7 +97,7 @@ def write_policy(keys: dict[str, str]) -> None:
                         "allowed_servers": [
                             {
                                 "server_id": "default",
-                                "allowed_tools": ["send_email", "read_inbox"],
+                                "allowed_tools": developer_tools or ["send_email", "read_inbox"],
                             }
                         ],
                     },
@@ -97,11 +113,25 @@ def write_policy(keys: dict[str, str]) -> None:
     )
 
 
+async def clear_risk_counters() -> None:
+    """Dev-only wipe of the Redis risk counters (same as the integration fixture).
+    Called at reset AND again once the gateway accepts this run's key: until the
+    fresh policy is loaded, wait_for_gateway's polls are wrong-key 401s that bump
+    the gateway-wide auth-failure factor and would distort the first risk scores."""
+    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    try:
+        risk_keys = await redis_client.keys("risk:*")
+        if risk_keys:
+            await redis_client.delete(*risk_keys)
+    finally:
+        await redis_client.aclose()
+
+
 async def reset_dev_state() -> None:
     """Fresh slate for a repeatable recording: dev-only wipe of the audit chain,
-    drift baselines, and cached pointers — same reset the integration suite uses.
-    A leftover baseline from a prior run would make the benign schema itself
-    register as drift."""
+    drift baselines, risk counters, and cached pointers — same reset the integration
+    suite uses. A leftover baseline from a prior run would make the benign schema
+    itself register as drift."""
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     try:
         await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
@@ -109,6 +139,7 @@ async def reset_dev_state() -> None:
         sys.exit("redis not reachable — run: docker compose up -d redis")
     finally:
         await redis_client.aclose()
+    await clear_risk_counters()
     try:
         async with engine.begin() as conn:
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
@@ -228,6 +259,59 @@ async def approve_and_retry(keys: dict[str, str]) -> None:
         print(f"  {result.content[0].text}")  # type: ignore[union-attr]
 
 
+async def replay_blocked(api_key: str) -> None:
+    """README recording-script step 6: the exact same request a second time — the
+    Replay Guard dedupes the nonce, so byte-identical retries never re-execute."""
+    section("the developer's client replays the exact same request — blocked")
+    arguments = {"to": "a@b.c", "subject": "hi again", "body": "hello", "bcc": "x@y.z"}
+    meta = fresh_meta()
+    async with connect(api_key) as session:
+        await session.call_tool("send_email", arguments, meta=meta)
+        print("  first send (fresh nonce): allowed")
+        try:
+            await session.call_tool("send_email", arguments, meta=meta)
+            sys.exit("expected DENY_REPLAY — identical nonce should never execute twice")
+        except McpError as error:
+            decision = error.error.data
+            print(f"  identical request replayed: event_type={decision['event_type']}")
+            print(f"  reason: {decision['reason']}")
+            print(f"  audit_id: {decision['audit_id']}")
+
+
+async def simulate_draft_policy(keys: dict[str, str]) -> None:
+    """README recording-script step 7: preview a tightened draft policy against the
+    demo traffic just generated. Activation is what records the revision snapshot the
+    simulator replays against (item 19/21), so the draft is hot-loaded first — the
+    simulation itself is read-only and writes nothing."""
+    section("policy simulation — preview a tightened v2 policy against today's traffic")
+    write_policy(keys, version=2, developer_tools=["read_inbox"])
+    print("  v2 draft written to policies/demo-policy.yaml: developer LOSES send_email.")
+    print("  In another terminal:  docker kill -s HUP securemcp-gateway-1")
+    print("  (hot-reloads v2 and records the revision snapshot the simulator needs)")
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    async with httpx.AsyncClient() as client:
+        for _ in range(240):
+            response = await client.post(
+                f"{GATEWAY}/admin/policy/simulate",
+                headers={"X-SecurMCP-Key": keys["ops-admin"]},
+                json={"candidate_version": 2, "replay_window": f"{today}..{today}"},
+            )
+            if response.status_code == 200:
+                break
+            await asyncio.sleep(0.5)  # 404 until the operator's SIGHUP records v2
+        else:
+            sys.exit("v2 never activated — was the SIGHUP sent?")
+    report = response.json()
+    print(f"  replayed {report['total_replayed']} of this demo's decisions against v2:")
+    for counter in ("would_now_deny", "would_now_require_approval", "newly_allowed", "unchanged"):
+        print(f"    {counter}: {report[counter]}")
+    for diff in report["sample_diffs"][:3]:
+        print(
+            f"    e.g. seq={diff['audit_seq']} {diff['identity']} -> {diff['tool']}:"
+            f" {diff['before']} -> {diff['after']}"
+        )
+
+
 async def show_audit_receipts() -> None:
     section("audit log receipts (tamper-evident, hash-chained, ECDSA-signed)")
     async with async_session() as db:
@@ -246,14 +330,23 @@ async def show_audit_receipts() -> None:
         detail = {
             k: v
             for k, v in row.payload.items()
-            if k in ("served_tools", "pruned_tools", "severity", "reason", "new_hash")
+            if k
+            in (
+                "served_tools",
+                "pruned_tools",
+                "severity",
+                "reason",
+                "new_hash",
+                "old_version",
+                "new_version",
+            )
         }
         print(f"  seq={row.seq} {row.event_type} identity={row.identity_id!r} {detail}")
     await engine.dispose()
 
 
 async def main() -> None:
-    section("SecurMCP demo — schema pruning + drift blocking (rug pull)")
+    section("SecurMCP demo — pruning, drift blocking, replay guard, policy simulation")
     STATE_PATH.unlink(missing_ok=True)  # start from the benign schema
     await reset_dev_state()
     keys = {"developer": mint_key(), "ops-admin": mint_key()}
@@ -267,6 +360,7 @@ async def main() -> None:
     )
 
     await wait_for_gateway(keys["developer"])
+    await clear_risk_counters()  # the waiting polls above were wrong-key 401s
 
     await show_tools("developer", keys["developer"])
     print(
@@ -287,6 +381,8 @@ async def main() -> None:
     await wait_for_mutation()
     await drift_and_block(keys["developer"])
     await approve_and_retry(keys)
+    await replay_blocked(keys["developer"])
+    await simulate_draft_policy(keys)
     await show_audit_receipts()
     section("done")
 
