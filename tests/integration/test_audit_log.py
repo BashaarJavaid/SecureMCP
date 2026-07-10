@@ -54,13 +54,21 @@ async def test_decision_points_write_chained_rows(gateway: Gateway) -> None:
     await drive_session(gateway)
     rows = await fetch_rows()
 
-    assert [r.event_type for r in rows] == ["SESSION_START", "TOOLS_LIST", "ALLOW", "DENY_RBAC"]
-    assert all(r.identity_id == "agent-readonly" for r in rows)
+    # Row 0 is the boot-time activation (item 19); the session's rows follow.
+    assert [r.event_type for r in rows] == [
+        "POLICY_ACTIVATED",
+        "SESSION_START",
+        "TOOLS_LIST",
+        "ALLOW",
+        "DENY_RBAC",
+    ]
+    assert rows[0].identity_id == "startup"
+    assert all(r.identity_id == "agent-readonly" for r in rows[1:])
     assert all(r.policy_version == 1 for r in rows)
-    assert rows[2].tool_name == "echo"
-    assert rows[3].tool_name == "add"
-    assert rows[1].payload["served_tools"] == ["echo"]
-    assert rows[1].payload["pruned_tools"] == ["add"]
+    assert rows[3].tool_name == "echo"
+    assert rows[4].tool_name == "add"
+    assert rows[2].payload["served_tools"] == ["echo"]
+    assert rows[2].payload["pruned_tools"] == ["add"]
 
     assert rows[0].prev_hash == GENESIS_HASH
     for prev, row in zip(rows, rows[1:], strict=False):
@@ -101,7 +109,13 @@ async def test_verifier_passes_then_catches_tampering(gateway: Gateway) -> None:
     assert "TAMPERED" in result.stdout
 
 
-async def test_concurrent_writes_do_not_collide(clean_audit: None) -> None:
+async def test_concurrent_audit_writes_do_not_collide(clean_audit: None) -> None:
+    """§11's named test: 100 concurrent write() calls against the Redis-cached
+    latest_audit_hash pointer — every seq unique, every curr_hash unique, and
+    the chain contiguous with no gaps. One writer instance, deliberately: that
+    is the supported deployment envelope (one gateway process owns one writer;
+    multi-replica write ordering is the documented §10 deferral, and two writer
+    instances demonstrably fork the chain via the WatchError retry re-insert)."""
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     writer = AuditWriter(
         redis_client,
@@ -111,14 +125,15 @@ async def test_concurrent_writes_do_not_collide(clean_audit: None) -> None:
     )
     try:
         seqs = await asyncio.gather(
-            *(writer.write(EventType.ALLOW, f"id-{i}", tool_name="echo") for i in range(50))
+            *(writer.write(EventType.ALLOW, f"id-{i}", tool_name="echo") for i in range(100))
         )
     finally:
         await redis_client.aclose()
 
-    assert len(set(seqs)) == 50
+    assert len(set(seqs)) == 100
     rows = await fetch_rows()
-    assert len(rows) == 50
+    assert len(rows) == 100
+    assert len({row.curr_hash for row in rows}) == 100
     assert rows[0].prev_hash == GENESIS_HASH
     for prev, row in zip(rows, rows[1:], strict=False):
         assert row.prev_hash == prev.curr_hash

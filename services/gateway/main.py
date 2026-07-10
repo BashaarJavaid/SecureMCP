@@ -4,22 +4,34 @@ import asyncio
 import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+from pydantic import BaseModel
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from services.gateway import auth, logging_config, signing
+from services.gateway import (
+    auth,
+    decision_explainer,
+    logging_config,
+    policy_engine,
+    policy_simulator,
+    policy_versions,
+    signing,
+)
+from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
-from services.gateway.db import async_session
+from services.gateway.db import AuditLog, async_session
 from services.gateway.decision import Decision, DecisionOutcome, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
+from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
 
@@ -31,8 +43,17 @@ KEY_HEADER = "x-securmcp-key"
 
 async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
     old_version = store.engine.version
-    if not store.reload():
+    candidate = store.load_candidate()
+    if candidate is None:
         return  # last-known-good stays active; failure already logged
+    try:
+        # Record before swap (item 19): a rejected or unrecordable activation keeps
+        # last-known-good (§5 fail-closed).
+        await policy_versions.record_activation(candidate, "operator", async_session)
+    except Exception:
+        logger.exception("policy_activation_rejected_keeping_last_known_good")
+        return
+    store.swap(candidate)
     try:
         await writer.write(
             EventType.POLICY_ACTIVATED,
@@ -55,9 +76,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.policy_store = store
     signing_key = signing.load_private_key(settings.signing_key_file)
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
     writer = AuditWriter(redis_client, async_session, store, signing_key)
+    app.state.audit_writer = writer  # rollback endpoint (item 19)
+    # Record + audit the boot-time activation (item 19). A monotonicity conflict
+    # (e.g. same version, different content) fails startup; the snapshot/row are
+    # idempotent on a re-seen version but the audit row is unconditional, so every
+    # boot's active policy — including one reverting a rollback — is in the chain.
+    await policy_versions.record_activation(store.engine, "startup", async_session)
+    await writer.write(
+        EventType.POLICY_ACTIVATED,
+        "startup",
+        payload_extra={
+            "old_version": None,
+            "new_version": store.engine.version,
+            "content_hash": store.engine.content_hash,
+        },
+    )
     detector = DriftDetector(async_session, writer)
     app.state.drift_detector = detector
+    risk_engine = RiskEngine(redis_client, detector)
+    app.state.risk_engine = risk_engine
+    approval_store = ApprovalStore(async_session, writer)
+    app.state.approval_store = approval_store
+    # Restart-durable approvals (§4.8): expire pending rows whose TTL lapsed while
+    # the gateway was down before serving traffic.
+    await approval_store.expire_stale()
     manager = SessionManager(
         redis_client,
         store,
@@ -65,6 +109,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         SchemaCache(redis_client),
         detector,
         ReplayGuard(redis_client, settings.replay_window_seconds),
+        risk_engine,
+        approval_store,
     )
     app.state.session_manager = manager
     sweep = asyncio.create_task(manager.sweep_loop())
@@ -95,7 +141,9 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
     """Drift re-approval (§4.8): snapshot the observed schema as the accepted baseline.
     Audited, authenticated admin action — requires a key resolving to an admin identity."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = auth.resolve_identity(request.headers.get(KEY_HEADER), store.engine)
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid or missing API key")
     if not store.engine.is_admin(identity_id):
@@ -116,6 +164,196 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
     return decision.model_dump(mode="json")
 
 
+@app.post("/admin/approvals/{approval_id}/approve")
+async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
+    """Human approval grant (§4.8, item 16): flips a pending approval to approved so
+    the client's retry (params._meta["securmcp/approval_id"]) can redeem it once.
+    Also applies one risk-decay step for the (identity, tool) pair — a human judged
+    this high-risk call fine, and that calibrates future behavioral scoring."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    approval_store: ApprovalStore = request.app.state.approval_store
+    try:
+        seq, requester_id, tool_name = await approval_store.approve(
+            approval_id, approved_by=identity_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    risk_engine: RiskEngine = request.app.state.risk_engine
+    await risk_engine.apply_decay(requester_id, tool_name)
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.APPROVED,
+        reason=f"call to {tool_name!r} approved by {identity_id!r}",
+        matched_rules=["admin_approval"],
+        policy_version=store.engine.version,
+        audit_id=str(seq),
+        approval_id=approval_id,
+    )
+    return decision.model_dump(mode="json")
+
+
+@app.post("/admin/policy/rollback/{version}")
+async def rollback_policy(version: int, request: Request) -> dict[str, object]:
+    """Re-activate a prior policy revision (§4.8, item 19): loads the append-only
+    snapshot, verifies it against the recorded content_hash, swaps the in-memory
+    PolicyStore, and refreshes the policy_versions row. In-memory only — POLICY_FILE
+    on disk is mounted read-only and keeps the newer version until the operator
+    updates it; a restart re-activates whatever is on disk (audited)."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    snapshot = policy_versions.snapshot_path(version)
+    if not snapshot.exists():
+        raise HTTPException(status_code=404, detail=f"no revision snapshot for v{version}")
+    try:
+        engine = policy_engine.load_bytes(snapshot.read_bytes())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"revision v{version} is invalid") from exc
+    try:
+        await policy_versions.record_rollback(engine, identity_id, async_session)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except policy_versions.ActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    old_version = store.engine.version
+    writer: AuditWriter = request.app.state.audit_writer
+    seq = await writer.write(
+        EventType.POLICY_ACTIVATED,
+        identity_id,
+        payload_extra={
+            "old_version": old_version,
+            "new_version": engine.version,
+            "content_hash": engine.content_hash,
+            "rollback": True,
+        },
+    )
+    store.swap(engine)
+    logger.warning(
+        "policy_rolled_back_in_memory_only",
+        old_version=old_version,
+        new_version=engine.version,
+        hint="POLICY_FILE on disk still holds the newer version; update it or a restart reverts",
+    )
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.POLICY_ACTIVATED,
+        reason=f"policy rolled back from v{old_version} to v{engine.version} by {identity_id!r}",
+        matched_rules=["admin_rollback"],
+        policy_version=engine.version,
+        audit_id=str(seq),
+    )
+    return decision.model_dump(mode="json")
+
+
+async def _require_admin(request: Request) -> str:
+    """Shared /admin/* auth (item 20 endpoints): key resolves to an admin identity."""
+    store: PolicyStore = request.app.state.policy_store
+    identity_id = await auth.resolve_identity_tracked(
+        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
+    )
+    if identity_id is None:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+    if not store.engine.is_admin(identity_id):
+        raise HTTPException(status_code=403, detail="admin identity required")
+    return identity_id
+
+
+@app.get("/admin/decisions/{seq}")
+async def get_decision(seq: int, request: Request) -> dict[str, object]:
+    """Decision Explanation, historical entry point (§4.8, item 20): reconstruct the
+    canonical Decision an audit row recorded. {seq} is the audit_log seq — the same
+    value clients receive as Decision.audit_id. Non-decision rows are 404."""
+    await _require_admin(request)
+    async with async_session() as session:
+        row = await session.get(AuditLog, seq)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no audit row {seq}")
+    try:
+        decision = decision_explainer.from_audit_row(row)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return decision.model_dump(mode="json")
+
+
+class ExplainRequest(BaseModel):
+    identity: str
+    tool: str
+    arguments: dict[str, Any] = {}
+    context: dict[str, Any] = {}
+
+
+@app.post("/admin/decisions/explain")
+async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, object]:
+    """Decision Explanation, hypothetical entry point (§4.8, item 20): dry-run the
+    §4.2 pipeline for a would-be call against the current in-memory policy — no
+    audit rows, no approvals, no counter bumps, no upstream traffic."""
+    await _require_admin(request)
+    decision = await decision_explainer.explain_call(
+        body.identity,
+        body.tool,
+        body.arguments,
+        body.context,
+        engine=request.app.state.policy_store.engine,
+        detector=request.app.state.drift_detector,
+        risk=request.app.state.risk_engine,
+        schema_cache=SchemaCache(request.app.state.redis),
+    )
+    return decision.model_dump(mode="json")
+
+
+@app.post("/admin/policy/simulate")
+async def simulate_policy(
+    body: policy_simulator.SimulateRequest, request: Request
+) -> dict[str, object]:
+    """Policy Simulation Mode (§4.8, item 21): replay historical decisions against
+    a candidate revision (candidate_version) or diff two revisions
+    (compare_versions) — read-only, nothing is activated and nothing is audited."""
+    await _require_admin(request)
+    if (body.candidate_version is None) == (body.compare_versions is None):
+        raise HTTPException(
+            status_code=400,
+            detail="exactly one of candidate_version or compare_versions is required",
+        )
+    if body.compare_versions is not None and len(body.compare_versions) != 2:
+        raise HTTPException(status_code=400, detail="compare_versions must be exactly 2 versions")
+    deps: dict[str, Any] = {
+        "sessionmaker": async_session,
+        "detector": request.app.state.drift_detector,
+        "risk": request.app.state.risk_engine,
+        "schema_cache": SchemaCache(request.app.state.redis),
+    }
+    try:
+        result: policy_simulator.HistoricalSimulation | policy_simulator.CompareSimulation
+        if body.candidate_version is not None:
+            result = await policy_simulator.simulate_historical(
+                body.candidate_version, body.replay_window, **deps
+            )
+        else:
+            assert body.compare_versions is not None
+            result = await policy_simulator.simulate_compare(
+                body.compare_versions, body.replay_window, **deps
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except policy_versions.ActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result.model_dump(mode="json")
+
+
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport."""
     manager: SessionManager = scope["app"].state.session_manager
@@ -123,8 +361,10 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     session_id = headers.get(MCP_SESSION_ID_HEADER)
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
-    identity_id = auth.resolve_identity(
-        headers.get(KEY_HEADER), scope["app"].state.policy_store.engine
+    identity_id = await auth.resolve_identity_tracked(
+        headers.get(KEY_HEADER),
+        scope["app"].state.policy_store.engine,
+        scope["app"].state.redis,
     )
     if identity_id is None:
         await Response("invalid or missing API key", status_code=401)(scope, receive, send)

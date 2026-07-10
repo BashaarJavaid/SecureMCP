@@ -63,6 +63,9 @@ async def clean_audit() -> None:
     try:
         await redis_client.ping()
         await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
+        risk_keys = await redis_client.keys("risk:*")
+        if risk_keys:
+            await redis_client.delete(*risk_keys)
     except Exception:
         pytest.skip("redis not reachable — run: docker compose up -d redis")
     finally:
@@ -75,6 +78,8 @@ async def clean_audit() -> None:
             await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
             await conn.execute(text("TRUNCATE tool_baselines"))
             await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
+            await conn.execute(text("TRUNCATE approvals"))
+            await conn.execute(text("TRUNCATE policy_versions"))
     except Exception:
         pytest.skip("postgres not reachable — run: docker compose up -d postgres")
 
@@ -141,8 +146,10 @@ async def running_gateway(
     old_command = settings.upstream_command
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file
+    old_revisions_dir = settings.policy_revisions_dir
     settings.policy_file = str(policy_path)
     settings.upstream_command = upstream_command
+    settings.policy_revisions_dir = str(policy_path.parent / "revisions")
     private_path, public_path = write_signing_keypair(policy_path.parent)
     settings.signing_key_file = str(private_path)
     settings.signing_public_key_file = str(public_path)
@@ -162,6 +169,7 @@ async def running_gateway(
         settings.upstream_command = old_command
         settings.signing_key_file = old_signing_key
         settings.signing_public_key_file = old_signing_pub
+        settings.policy_revisions_dir = old_revisions_dir
         server.should_exit = True
         await task
 

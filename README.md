@@ -8,7 +8,7 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, e
 
 This README is intentionally short. Deeper detail lives in dedicated files so an AI coding agent (or a human) only loads what's relevant to the task at hand, rather than the entire design on every session:
 
-- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — core architecture, decision pipeline, all components, failure modes, security hardening, observability, cache invalidation, performance benchmarks, scalability, testing strategy, CI/CD, deployment
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — core architecture, decision pipeline, all components, failure modes, security hardening, observability, cache invalidation, performance benchmarks, scalability, testing strategy, CI/CD, deployment; component/deployment/data-flow diagrams live in §4.4–§4.7
 - [`THREAT_MODEL.md`](./THREAT_MODEL.md) — what's protected against, what isn't, and the assumptions the whole model rests on
 - [`docs/adr/`](./docs/adr/) — one file per consequential architecture decision, including why several common alternatives (Envoy, OPA, Kong, NGINX, sidecars, client-SDK middleware) weren't chosen for v1
 - [`ROADMAP.md`](./ROADMAP.md) — the four-phase build order, kept as a living checklist
@@ -192,7 +192,7 @@ Recording script — a single continuous story rather than a feature checklist:
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
 
-As of Phase 2, steps 1–2, the drift-blocking half of 3, the approval in 4 (via `POST /admin/tools/{server}/{tool}/approve` — the Decision Explanation endpoint is Phase 3), 5, and 6 are live and driven by `scripts/run_demo.py`; the Risk Engine flag in step 3 and the simulation in step 7 land with Phase 3.
+As of Phase 3 (items 16–20), steps 1–6 are fully live — including the Risk Engine flag in step 3 and step 4's `GET /admin/decisions/{id}` Decision Explanation endpoint; `scripts/run_demo.py` drives the pruning + drift-blocking arc, and only the simulation in step 7 remains (Phase 3, item 21).
 
 ---
 

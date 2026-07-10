@@ -10,50 +10,51 @@ Core design of SecurMCP: the decision pipeline, every component, failure behavio
 
 ### 4.1 High-level flow
 
+The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the standalone SSE transport in 2025-03); the upstream side is a stdio subprocess per session (see §4.8, Session Manager).
+
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client (Claude/Cursor/custom agent)
+    participant Client as MCP Client (Streamable HTTP)
     participant Gateway as SecurMCP Gateway
-    participant Policy as Policy Engine
     participant Audit as Audit Log (Postgres)
-    participant RiskEngine as Risk Engine
-    participant Server as Real MCP Server
+    participant Server as Upstream MCP Server (stdio)
 
     Client->>Gateway: initialize (capabilities)
     Gateway->>Server: initialize (forwarded)
     Server-->>Gateway: server capabilities
-    Gateway->>Audit: log session start (identity, timestamp)
+    Gateway->>Audit: SESSION_START (identity, timestamp)
     Gateway-->>Client: negotiated capabilities
 
     Client->>Gateway: tools/list
     Gateway->>Server: tools/list (forwarded)
     Server-->>Gateway: full tool schema set
-    Gateway->>Gateway: schema hash vs cached baseline (drift check)
-    Gateway->>Policy: resolve identity → allowed tool set
-    Gateway->>Gateway: prune unauthorized tools
-    Gateway->>Audit: log pruned/flagged tools
+    Gateway->>Gateway: cache schemas (Redis, TTL)
+    Gateway->>Gateway: drift check vs stored baseline (classify + log DRIFT_*)
+    Gateway->>Gateway: RBAC prune to identity's allowed set
+    Gateway->>Audit: TOOLS_LIST (pruned/flagged tools)
     Gateway-->>Client: filtered tool schema
 
     Client->>Gateway: tools/call (tool_name, args, nonce, timestamp)
-    Gateway->>Gateway: replay check (nonce + timestamp window in Redis)
-    Gateway->>Policy: is tool_name authorized for identity? (RBAC + ABAC conditions)
-    alt unauthorized, drifted, or replay
-        Gateway->>Audit: log DENY + reason (signed)
-        Gateway-->>Client: JSON-RPC error (unauthorized / schema drift / replay detected)
-    else authorized
-        Gateway->>Gateway: validate + sanitize args against cached schema
-        Gateway->>RiskEngine: score(identity, tool, context, history)
-        alt risk score high
-            Gateway->>Audit: log CHALLENGE / HUMAN_APPROVAL_REQUIRED (signed)
-            Gateway-->>Client: JSON-RPC error (pending approval) or step-up challenge
-        else risk score acceptable
-            Gateway->>Server: tools/call (forwarded)
-            Server-->>Gateway: result
-            Gateway->>Audit: log ALLOW + args + result + latency (signed)
-            Gateway-->>Client: result
-        end
+    Note over Gateway: full pipeline, in order (section 4.2): 1 replay, 2 auth, 3 RBAC, 4 ABAC, 5 drift, 6 risk, 7 param validation
+    alt a stage denies (stages 1-5, risk score over 90, or stage 7)
+        Gateway->>Audit: DENY_* + reason (signed)
+        Gateway-->>Client: JSON-RPC error (canonical Decision, section 4.3)
+    else risk score 40-69
+        Gateway->>Audit: CHALLENGE (signed)
+        Gateway-->>Client: step-up challenge required
+    else risk score 70-90
+        Gateway->>Audit: HUMAN_APPROVAL_REQUIRED (signed)
+        Gateway-->>Client: pending approval (approval_id)
+        Note over Client,Gateway: admin approves via POST /admin/approvals/id/approve, then the client re-invokes with the approval_id in params._meta (one-time redemption, 15-min TTL, arguments hash re-checked)
+    else risk score under 40, params valid
+        Gateway->>Server: tools/call (forwarded)
+        Server-->>Gateway: result
+        Gateway->>Audit: ALLOW + args + result + latency (signed)
+        Gateway-->>Client: result
     end
 ```
+
+`tools/list` deliberately does **not** run the full pipeline — it forwards upstream, caches the schemas, runs the drift check (classification + logging; blocking is enforced per-call at pipeline stage 5), and prunes the response to the identity's RBAC allow-set. Full enforcement happens on every `tools/call`:
 
 > **Design principle, stated explicitly:** `tools/list` pruning is a *planning-surface* control — it shapes what an LLM even considers as an option — and is not itself a security boundary. Nothing prevents a client from calling a tool name it already knows about (from a prior session, from documentation, from having guessed) without ever re-issuing `tools/list`. Therefore **every `tools/call` independently re-runs the full decision pipeline** (below) regardless of whether that tool appeared in the most recent pruned list served to that client. Relying on "the client didn't see it in the menu" as the actual enforcement mechanism is a well-known pitfall — the real boundary is authorization checked fresh at the point of action, every time.
 
@@ -114,70 +115,158 @@ Every terminal outcome from the pipeline above — whether returned as a JSON-RP
 
 ### 4.4 Component diagram
 
+Every box inside the gateway subgraph is a module in `services/gateway/` with the same name. The pipeline stages (numbered) are wired in §4.2 order by the JSON-RPC Interceptor; the admin-surface components (Approvals, Decision Explainer, Policy Simulator) sit off the live request path.
+
 ```mermaid
 graph TD
-    Client[MCP Client] --> Gateway[SecurMCP Gateway]
-    Gateway --> RiskEngine[Risk Engine]
-    Gateway --> PolicyEngine[Policy Engine]
-    Gateway --> ReplayGuard[Replay Guard]
-    Gateway --> AuditLog[Audit Log Writer]
-    RiskEngine --> Redis[(Redis: counters, cache, nonces)]
-    PolicyEngine --> Postgres[(Postgres: policies, versions)]
-    ReplayGuard --> Redis
-    AuditLog --> Postgres
-    Gateway --> ServerA[MCP Server A]
-    Gateway --> ServerB[MCP Server B]
-    Gateway --> ServerC[MCP Server C]
+    Client["MCP Client"] -->|"Streamable HTTP"| Interceptor
+
+    subgraph Gateway["SecurMCP Gateway process"]
+        Interceptor["JSON-RPC Interceptor + Session Manager"]
+        Interceptor --> Replay["1 Replay Guard"]
+        Replay --> Auth["2 Auth / Identity"]
+        Auth --> Policy["3+4 Policy Engine: RBAC + ABAC conditions + versioning"]
+        Policy --> Drift["5 Drift Detector"]
+        Drift --> Risk["6 Risk Engine"]
+        Risk --> Validator["7 Param Validator"]
+        Validator --> UpClient["Upstream Client"]
+        Interceptor --> SchemaCache["Schema Cache + Pruner (tools/list)"]
+        Interceptor --> AuditW["Audit Log Writer (hash-chained, ECDSA-signed)"]
+        Approvals["Approvals lifecycle (admin API)"]
+        Explainer["Decision Explainer (admin API)"]
+        Simulator["Policy Simulator (admin API)"]
+    end
+
+    UpClient --> SrvA["MCP Server A (stdio subprocess, per session)"]
+    UpClient --> SrvB["MCP Server B (stdio subprocess, per session)"]
+
+    Replay --> Redis[("Redis: nonces, schema cache, risk counters, session TTL")]
+    Risk --> Redis
+    SchemaCache --> Redis
+
+    Policy --> PG[("Postgres: audit_log, policy_versions, tool_baselines, approvals")]
+    Drift --> PG
+    AuditW --> PG
+    Approvals --> PG
+    Explainer --> PG
+    Simulator --> PG
+    Policy --> Rev["policies/revisions/ snapshots (rw submount)"]
+    Simulator --> Rev
+
+    Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-### 4.5 Deployment diagram (production target, Phase 4)
+Edges elided for readability: Auth bumps the gateway-wide auth-failure counter in Redis on wrong-key attempts; the Interceptor bumps the per-identity denial counter in Redis on every `DENY_*` terminal; the Decision Explainer reads the shared schema cache for dry-run param validation. The verifier sidecar reads only the public signing key — the private key never leaves the gateway process.
+
+### 4.5 Deployment diagrams
+
+**(a) MVP — Docker Compose (what this repo runs today).** Five services on one host; the upstream MCP server is *not* a compose service — it's a stdio subprocess spawned per session inside the gateway container (`UPSTREAM_COMMAND`). The `rogue` service exists only to host the demo's mutation endpoint; the rogue MCP server itself also runs as stdio subprocesses inside the gateway.
+
+```mermaid
+graph TD
+    C["MCP client (host)"] -->|"Streamable HTTP :8000"| G
+
+    subgraph Compose["Docker Compose, single host"]
+        subgraph GWC["gateway container"]
+            G["SecurMCP Gateway (FastAPI)"]
+            U["stdio upstream subprocess, one per session"]
+            G --> U
+        end
+        PG[("postgres:16  :5432")]
+        R[("redis:7  :6379")]
+        V["verifier sidecar (audit_verifier_daemon, read-only)"]
+        RG["rogue admin service :9800 (demo only)"]
+    end
+
+    G --> PG
+    G --> R
+    V --> PG
+    RG -.->|"shared .rogue-state bind mount"| G
+```
+
+Volume posture, security-relevant: `./policies` is mounted **read-only** into the gateway (a compromised gateway can't persist a policy backdoor), with only the `./policies/revisions` submount writable for activation snapshots; `./secrets` is read-only, and the verifier container mounts it only to read the **public** key — the signing private key is never given to any other service.
+
+**(b) Production target (Phase 4, not built).**
 
 ```mermaid
 graph TD
     LB[Load Balancer / ALB] --> G1[Gateway replica 1]
     LB --> G2[Gateway replica 2]
     LB --> G3[Gateway replica 3]
-    G1 --> RedisC[(Redis - shared)]
+    G1 --> RedisC[(Redis - shared, ElastiCache)]
     G2 --> RedisC
     G3 --> RedisC
     G1 --> PG[(Postgres - shared, RDS)]
     G2 --> PG
     G3 --> PG
-    G1 --> Servers[Upstream MCP Servers]
+    G1 --> Servers[Upstream MCP Servers - network transport]
     G2 --> Servers
     G3 --> Servers
 ```
 
-Every gateway replica is stateless and reads/writes the same Redis and Postgres instances, so adding replicas behind the load balancer is the entire scaling story for **SSE-connected upstream servers** — no session affinity or local cache required. See section 10 for the write-amplification caveat this introduces on the Postgres side.
+Every gateway replica is stateless and reads/writes the same Redis and Postgres instances — replay nonces, schema cache, risk counters, and session-liveness keys are all in Redis; audit chain, policy versions, drift baselines, and approvals are all in Postgres — so adding replicas behind the load balancer is the entire scaling story for **network-connected (Streamable HTTP) upstream servers**; no session affinity or local cache required. See section 10 for the write-amplification caveat this introduces on the Postgres side.
 
-> **Explicit scoping — the stdio/multi-replica conflict, resolved:** a `stdio`-connected upstream server is spawned as a child subprocess by whichever gateway replica first handles that session; it is not visible to, or shareable with, any other replica. If a client's requests are load-balanced across replicas (the default behavior of an ALB with no affinity configured), a `stdio` server's subprocess on Replica 1 is simply unreachable from Replica 2. This is a real constraint, not an edge case, so it's stated plainly rather than left implied by "stateless replicas": **multi-replica, load-balanced deployment is supported only for SSE-connected upstream servers.** Any deployment that needs a `stdio`-connected server must either (a) configure sticky sessions at the load balancer so a given client always lands on the replica that owns its subprocess, or (b) run the gateway as a single instance for that server. This is documented as a hard deployment constraint, not a future fix — it follows directly from what a local subprocess is.
+> **Explicit scoping — the stdio/multi-replica conflict, resolved:** a `stdio`-connected upstream server is spawned as a child subprocess by whichever gateway replica first handles that session; it is not visible to, or shareable with, any other replica. If a client's requests are load-balanced across replicas (the default behavior of an ALB with no affinity configured), a `stdio` server's subprocess on Replica 1 is simply unreachable from Replica 2. This is a real constraint, not an edge case, so it's stated plainly rather than left implied by "stateless replicas": **multi-replica, load-balanced deployment is supported only for network-connected upstream servers.** Any deployment that needs a `stdio`-connected server must either (a) configure sticky sessions at the load balancer so a given client always lands on the replica that owns its subprocess, or (b) run the gateway as a single instance for that server. This is documented as a hard deployment constraint, not a future fix — it follows directly from what a local subprocess is. (The Compose MVP above sidesteps it entirely: one gateway instance, so every stdio subprocess is local by construction.)
 
 ### 4.6 Data flow diagram (single request, all stages)
 
+One `tools/call`, in exact §4.2 order. Note the ABAC split (item 17): conditions with no `risk.*` reference run at stage 4; `risk.*` conditions run immediately after scoring but *before* the 40/70/90 threshold mapping, so a failing `risk.score < 60` is `DENY_ABAC` even when the raw score would otherwise map to CHALLENGE or approval. Every terminal outcome — deny, challenge, approval-hold, or allow — ends in a signed, hash-chained audit write. The admin-only paths (`/admin/decisions/*`, `/admin/policy/simulate`) are deliberately absent: they dry-run this pipeline out-of-band (§4.8) and never sit in the live request path.
+
 ```mermaid
-graph LR
-    A[Request In] --> B[JSON-RPC Interception]
-    B --> C[Auth / Identity Resolution]
-    C --> D[Replay Check]
-    D --> E[Policy: RBAC + ABAC]
-    E --> F[Schema Drift Check]
-    F --> G[Risk Scoring]
-    G --> H{Decision}
-    H -->|allow| I[Param Validation]
-    I --> J[Forward to Upstream Server]
-    H -->|deny/challenge/approval| K[Return Error / Hold]
-    J --> L[Audit Log Write - signed, chained]
-    K --> L
+graph TD
+    IN["tools/call request"] --> P1["1 Replay Guard (nonce + timestamp, Redis)"]
+    P1 -->|replay| T["terminal Decision: DENY_* / CHALLENGE / HUMAN_APPROVAL_REQUIRED"]
+    P1 --> P2["2 Auth / Identity (API key hash)"]
+    P2 -->|unknown key| T
+    P2 --> P3["3 RBAC (allowed/denied tools per server)"]
+    P3 -->|deny| T
+    P3 --> P4["4 ABAC, non-risk conditions only"]
+    P4 -->|not satisfied| T
+    P4 --> P5["5 Drift status (baseline blocked?)"]
+    P5 -->|blocked| T
+    P5 --> P6["6 Risk Engine: score + factors"]
+    P6 --> P6b["ABAC risk.* conditions (before threshold mapping)"]
+    P6b -->|not satisfied| T
+    P6b --> P6c{"score"}
+    P6c -->|"91-100"| T
+    P6c -->|"70-90 approval, 40-69 challenge"| T
+    P6c -->|"0-39"| P7["7 Param Validation (cached schema, strict)"]
+    P7 -->|invalid| T
+    P7 --> P8["8 ALLOW: forward to upstream"]
+    P8 --> RES["result to client"]
+    T --> AUD["audit write (signed, hash-chained)"]
+    P8 --> AUD
 ```
 
 ### 4.7 Multi-Server Trust Domains (discussion, not implemented)
 
-The architecture so far treats every upstream MCP server as equally trusted once it's registered, but a real multi-tenant deployment won't have that property — servers are frequently owned by different teams or even different organizations, with different trust levels. Worth designing for even though it's out of scope to build for a solo portfolio project:
+**Why v1 treats every registered server as equally trusted.** The gateway's trust boundary today runs *between* the client and the upstream — never *between* upstreams. Any server named in the policy file is, once connected, as trusted as any other: same pipeline, same risk factors, same drift thresholds. That's the right call for v1's deployment shape — a single operator registers every upstream by hand (`UPSTREAM_COMMAND`), so registration *is* the trust decision, made by a human, out of band. It matches `THREAT_MODEL.md`'s posture of drawing scope boundaries explicitly: the threat model already trusts Redis and Postgres inside the deployment's network boundary for the same reason. What v1 *does* defend against per-server is behavioral: the Drift Detector catches a registered server that changes shape after approval (the rug-pull), regardless of who owns it.
 
-- Each registered server would carry a **trust score** (static, admin-assigned, or derived from drift history — a server that's mutated its schema five times this month is inherently less trusted than one that's been stable for a year).
-- The Risk Engine would fold trust score in as a factor, so the same tool call routed through a low-trust server scores higher risk than the identical call through a high-trust one.
-- Policies could scope by trust tier rather than only by `server_id` (`allow: trust_tier >= "verified"` alongside or instead of naming specific servers), which matters once the number of registered servers grows past what's practical to enumerate by hand.
-- This is documented in `ARCHITECTURE.md` as a named extension point (a `trust_score` field already reserved on the server-registration record, even if unused in v1) rather than left as a complete surprise if the project needs to grow into it later.
+**Where that assumption breaks.** The moment servers have different owners, "registered = trusted" stops describing reality:
+
+- **Third-party MCP servers** (a vendor's hosted server, a community server off a registry): the operator can audit the schema at registration time but controls neither the code nor the release cadence. Drift detection catches changes after the fact; it can't express "this server starts from a lower baseline of trust."
+- **Team-owned vs org-owned servers**: an internal platform team's server that went through security review shouldn't be scored identically to a side-project server someone registered for their own agent — yet today the only lever is enumerating tools per `server_id`, which encodes *authorization*, not *confidence*.
+- **Drift history as a trust signal**: a server whose schema has mutated five times this month is inherently less trustworthy than one stable for a year. The item-18 drift-history risk factor already implements exactly this signal *per tool*; a trust tier is the same idea lifted to the server as a whole.
+
+**The extension point: `trust_tier` on server registration.** When multi-server support grows a real registration record, it would carry an admin-assigned tier (with an optional numeric score for the Risk Engine), sketched here as policy YAML — **this key is not implemented; the policy loader will reject it today**:
+
+```yaml
+# SKETCH ONLY — not implemented; shown as the designed extension point.
+servers:
+  - server_id: "github-mcp"
+    trust_tier: "org-verified"     # org-verified | team-owned | third-party
+    trust_score: 90                # 0-100, admin-assigned; drift history could decay it
+  - server_id: "community-scraper"
+    trust_tier: "third-party"
+    trust_score: 40
+```
+
+Two consumers, both fitting mechanisms that already exist:
+
+1. **Risk Engine factor.** A `server_trust` factor is one more `evaluate(ctx) -> RiskFactor` function appended to the fixed factor list (§4.8) — low trust contributes weight, high trust contributes nothing; no engine change. The same `delete_repo` call then scores higher through the community server than through the org-verified one, and can cross the CHALLENGE or approval threshold on that difference alone. Decay rules would mirror item 18's boundary: an admin approving one call must not erase a server's instability record, so `server_trust` would be non-decayable like `drift_history`.
+2. **Policy scoping by tier.** Grants could say `conditions: ["server.trust_tier == 'org-verified'"]` (a third attribute root alongside `identity.*`/`context.*`/`risk.*` — an evaluator vocabulary addition, not a language change) instead of enumerating `server_id`s. This matters operationally once registered servers outgrow hand-enumeration: "read-only tools on any third-party server, write tools only on org-verified ones" is one rule, not one per server.
+
+**Explicit non-goals for v1:** no per-server trust scoring in code, no `trust_tier`/`trust_score` in the policy schema or loader, no multi-server registry or routing layer, no automatic tier derivation from drift history. Multi-server trust scoring is tracked as documented-only future work in `ROADMAP.md` item 29, alongside the other deliberate deferrals (OPA/Cedar migration, step-up auth). What this section commits to is only the shape of the extension — so if the project grows into it, trust lands as one risk factor plus one attribute root, not a redesign.
 
 ### 4.8 Component responsibilities
 

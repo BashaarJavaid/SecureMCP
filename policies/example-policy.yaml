@@ -1,9 +1,17 @@
-# RBAC-only policy (Phase 1, item 3). ABAC `conditions` are rejected until Phase 3, item 17.
 # The identities below are the demo cast for sample_target/overscoped_server.py.
 # api_key_hash values are non-functional placeholders — mint a real key/hash pair with:
 #   python scripts/generate_api_key.py
 # (or run `python scripts/run_demo.py`, which writes policies/demo-policy.yaml with real keys)
 version: 1
+# Risk Engine v1 inputs (Phase 3, item 16). Tiers: low/medium/high/critical; unlisted
+# tools contribute 0. protected_repos are fnmatch patterns matched against every
+# string argument value. Placeholders for the overscoped_server demo cast.
+risk:
+  tool_sensitivity:
+    delete_repo: high
+    read_file: low
+  protected_repos:
+    - "acme/prod-*"
 identities:
   - id: "developer"
     api_key_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -12,6 +20,17 @@ identities:
         allowed_tools: ["read_file", "list_issues"]
   - id: "ops-admin"
     api_key_hash: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    # identity.* attributes for ABAC conditions (item 17); identity.id needs no entry.
+    # attributes:
+    #   team: "engineering"
     allowed_servers:
       - server_id: "*"
         allowed_tools: ["*"]
+        # ABAC conditions (Phase 3, item 17): boolean expressions over dotted paths
+        # (identity.* / tool.* / context.hour / risk.score) with ==, !=, <, >, <=, >=,
+        # and/or/not, parentheses — nothing else. ALL listed conditions must hold once
+        # RBAC matches this grant; a condition referencing a missing attribute is
+        # not-satisfied as a whole (never inverted by `not`) and logs POLICY_ERROR.
+        # conditions:
+        #   - "identity.team == 'engineering' and context.hour < 20"
+        #   - "risk.score < 60"

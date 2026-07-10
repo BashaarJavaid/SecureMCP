@@ -25,13 +25,15 @@ async def fetch_events() -> list[tuple[str, int]]:
         return [(row.event_type, row.policy_version) for row in rows]
 
 
-async def sighup_and_wait_for_activation() -> None:
+async def sighup_and_wait_for_activation(version: int) -> None:
+    # Startup writes its own POLICY_ACTIVATED (item 19), so wait for the row that
+    # carries the reloaded version, not just any activation.
     os.kill(os.getpid(), signal.SIGHUP)  # handled by the gateway's loop handler
     for _ in range(60):
-        if any(event == "POLICY_ACTIVATED" for event, _ in await fetch_events()):
+        if ("POLICY_ACTIVATED", version) in await fetch_events():
             return
         await asyncio.sleep(0.05)
-    pytest.fail("POLICY_ACTIVATED never appeared after SIGHUP")
+    pytest.fail(f"POLICY_ACTIVATED for v{version} never appeared after SIGHUP")
 
 
 async def test_sighup_reload_applies_to_inflight_session(gateway: Gateway) -> None:
@@ -42,7 +44,7 @@ async def test_sighup_reload_applies_to_inflight_session(gateway: Gateway) -> No
         gateway.policy_path.write_text(
             yaml.safe_dump(policy_dict(gateway.keys, readonly_tools=["echo", "add"], version=2))
         )
-        await sighup_and_wait_for_activation()
+        await sighup_and_wait_for_activation(2)
 
         # The same in-flight session re-resolves against v2 on its next request (§8).
         tools = await session.list_tools()
@@ -64,7 +66,8 @@ async def test_broken_reload_keeps_last_known_good(gateway: Gateway) -> None:
         tools = await session.list_tools()  # old policy still enforced, gateway alive
         assert [tool.name for tool in tools.tools] == ["echo", "add"]
 
-    assert "POLICY_ACTIVATED" not in [event for event, _ in await fetch_events()]
+    # Only the boot-time activation (item 19) — the broken reload never activated.
+    assert [event for event, _ in await fetch_events()].count("POLICY_ACTIVATED") == 1
 
 
 async def test_call_without_listing_succeeds_via_transparent_refetch(gateway: Gateway) -> None:
@@ -111,7 +114,7 @@ async def test_etag_stable_then_changes_on_policy_reload(gateway: Gateway) -> No
         assert second.meta is not None and second.meta["etag"] == etag  # stable
 
         gateway.policy_path.write_text(yaml.safe_dump(policy_dict(gateway.keys, version=2)))
-        await sighup_and_wait_for_activation()
+        await sighup_and_wait_for_activation(2)
 
         third = await session.list_tools()
         assert third.meta is not None
