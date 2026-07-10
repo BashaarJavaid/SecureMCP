@@ -27,6 +27,67 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, i
 
 ---
 
+## Architecture
+
+Every box inside the gateway subgraph is a module in `services/gateway/` with the same name; the numbered stages are the decision pipeline in `ARCHITECTURE.md` §4.2 order. (This diagram is a copy of §4.4, which is the source of truth — the sequence diagram, deployment diagrams, data-flow diagram, and the multi-server trust-domain discussion live in §4.1 and §4.5–§4.7.)
+
+```mermaid
+graph TD
+    Client["MCP Client"] -->|"Streamable HTTP"| Interceptor
+
+    subgraph Gateway["SecurMCP Gateway process"]
+        Interceptor["JSON-RPC Interceptor + Session Manager"]
+        Interceptor --> Replay["1 Replay Guard"]
+        Replay --> Auth["2 Auth / Identity"]
+        Auth --> Policy["3+4 Policy Engine: RBAC + ABAC conditions + versioning"]
+        Policy --> Drift["5 Drift Detector"]
+        Drift --> Risk["6 Risk Engine"]
+        Risk --> Validator["7 Param Validator"]
+        Validator --> UpClient["Upstream Client"]
+        Interceptor --> SchemaCache["Schema Cache + Pruner (tools/list)"]
+        Interceptor --> AuditW["Audit Log Writer (hash-chained, ECDSA-signed)"]
+        Approvals["Approvals lifecycle (admin API)"]
+        Explainer["Decision Explainer (admin API)"]
+        Simulator["Policy Simulator (admin API)"]
+    end
+
+    UpClient --> SrvA["MCP Server A (stdio subprocess, per session)"]
+    UpClient --> SrvB["MCP Server B (stdio subprocess, per session)"]
+
+    Replay --> Redis[("Redis: nonces, schema cache, risk counters, session TTL")]
+    Risk --> Redis
+    SchemaCache --> Redis
+
+    Policy --> PG[("Postgres: audit_log, policy_versions, tool_baselines, approvals")]
+    Drift --> PG
+    AuditW --> PG
+    Approvals --> PG
+    Explainer --> PG
+    Simulator --> PG
+    Policy --> Rev["policies/revisions/ snapshots (rw submount)"]
+    Simulator --> Rev
+
+    Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
+```
+
+---
+
+## Threat Model (summary)
+
+The one-line version of [`THREAT_MODEL.md`](./THREAT_MODEL.md), which carries the full notes and — just as important — the explicit assumptions the model rests on (TLS termination, upstream server identity, Redis/Postgres trust boundaries):
+
+| Threat | Protected? | How / why not |
+|---|---|---|
+| Tool Poisoning (adversarial text in descriptions) | Yes | Descriptions are never executed by the gateway; schema pruning limits which descriptions an identity ever sees |
+| Rogue / rug-pulling MCP server | Yes | Drift Detector classifies schema mutations; High/Critical blocks at `tools/call` |
+| Unauthorized tool access by a known identity | Yes | RBAC + ABAC policy resolution |
+| Contextually risky calls by an *authorized* identity | Yes | Risk Engine (challenge / human approval / deny by score band) |
+| Replay of a captured request | Yes | Nonce + timestamp window, Redis dedup |
+| Prompt injection via tool *results* | Partial | Protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
+| Stolen API key | Partial | Behavioral risk factors and rate limiting reduce blast radius; a key alone can't be distinguished from its holder |
+| Compromised gateway host | No | Attacker has the signing key — deployment/infra hardening problem |
+| Malicious local user with container shell access | Partial | Non-root user and dropped capabilities limit, don't eliminate |
+| Insider admin abusing legitimate admin-API access | No | Attributable and tamper-evident after the fact, not prevented; two-person policy activation is designed (not built) in `ROADMAP.md`'s Beyond-v1 section |
 
 ---
 
@@ -34,7 +95,7 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, i
 
 | Layer | Choice | Why |
 |---|---|---|
-| Language | Python 3.12 | Matches your existing stack (ProdRescue), avoids context-switching cost of Go |
+| Language | Python 3.12 | Async-native ecosystem, first-party MCP SDK; avoids the context-switching cost of Go for a single-maintainer project |
 | Web/proxy framework | FastAPI + Starlette | Async-native, plays well with SSE and WebSocket transports |
 | MCP protocol handling | `mcp` official Python SDK | Don't hand-roll JSON-RPC 2.0 framing — use the reference client/server primitives and intercept at the session layer |
 | Database | PostgreSQL 16 | Audit log, policy store, schema cache — relational integrity matters for a hash chain |
@@ -45,20 +106,17 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, i
 | Auth (roadmap) | OAuth 2.1 + On-Behalf-Of token exchange | Documented as Phase 4 roadmap, not blocking MVP |
 | Policy expressions | Small hand-rolled boolean expression evaluator over Pydantic-typed attributes (identity, tool, context, risk_score) | Gives ABAC-style conditions without pulling in a full policy-as-code engine |
 | Policy language (roadmap) | OPA/Rego or Cedar | Documented as Phase 4 roadmap only — not built; embedded evaluator above is sufficient at this scale |
-| Risk Engine | Rule-based scoring function (Phase 1: weighted heuristics; Phase 3: optionally a small learned model) | Answers "should this run right now," not just "is this identity allowed" |
+| Risk Engine | Rule-based scoring: a fixed weighted factor list + behavioral Redis counters — deliberately no ML (see `ARCHITECTURE.md`, Risk Engine) | Answers "should this run right now," not just "is this identity allowed" |
 | Transport | Streamable HTTP (client-facing) + stdio subprocess passthrough (upstream) | Streamable HTTP supersedes the standalone SSE transport, which the MCP spec deprecated in 2025-03 — earlier drafts of this spec said SSE. **See the stateless-replica caveat in `ARCHITECTURE.md` §4.5**: stdio ties an upstream process to the specific gateway replica that spawned it, which constrains multi-replica deployment to network-connected (non-stdio) upstream servers only |
 | Replay protection | Nonce + timestamp window, deduped in Redis | Standard defense for a system fronting side-effecting calls |
 | Containerization | Docker + Docker Compose (local + MVP prod), multi-stage build | Isolated subprocess execution per session |
 | Orchestration (post-MVP) | AWS ECS Fargate; Kubernetes explicitly deferred | Compose + ECS is enough to prove the system works; K8s adds ops overhead with no proportional signal for v1 |
 | IaC (post-MVP) | Terraform | Added after the gateway itself works — VPC, RDS, ElastiCache, ECS, ALB, Secrets Manager |
 | Observability (post-MVP) | Prometheus + Grafana, structured JSON logs (structlog) | structlog ships in MVP; Prometheus/Grafana added once the gateway logic is stable, not before |
-| Testing | pytest, pytest-asyncio, hypothesis (for schema fuzzing), httpx test client | Unit + integration + adversarial suites |
-| CI/CD | GitHub Actions | Lint (ruff), type-check (mypy strict), test, coverage gate, build, push to ECR/GHCR |
+| Testing | pytest, pytest-asyncio, httpx test client | Unit + integration + adversarial suites; hypothesis schema fuzzing deferred (ROADMAP item 23) |
+| CI/CD | GitHub Actions | Lint (ruff), type-check (mypy strict), test, coverage gate, build; release pushes to GHCR on `v*` tags (ECR stays post-MVP) |
 | Secrets | AWS Secrets Manager / HashiCorp Vault (local: `.env` + docker secrets) | Never plaintext in repo or logs |
 | Cryptography | Python `hashlib` (SHA-256) for the chain, `cryptography` (ECDSA, P-256) for chain-segment signing | Hash-chain integrity plus tamper-proofing against a full chain regeneration |
-
----
-
 
 ---
 
@@ -67,69 +125,60 @@ SecurMCP sits as a transparent proxy between MCP clients and real MCP servers, i
 ```
 securmcp/
 ├── .github/workflows/
-│   ├── ci.yml                 # lint, typecheck, test, coverage gate
-│   └── release.yml            # build + push container image on tag
-├── docs/
-│   ├── architecture.md
-│   ├── threat-model.md
-│   ├── policy-schema.md
-│   └── img/ (mermaid renders, dashboard screenshots)
-├── infra/
-│   ├── terraform/
-│   │   ├── modules/ (vpc, rds, redis, ecs, secrets)
-│   │   └── envs/ (dev, prod)
-│   └── k8s/ (if EKS path: deployment.yaml, service.yaml, hpa.yaml)
+│   ├── ci.yml                     # lint, format check, mypy, test + coverage gate, benchmark on main, build
+│   └── release.yml                # build + push ghcr.io image on v* tags
+├── alembic/                       # migrations 0001–0004 (audit_log + policy_versions, tool_baselines,
+│                                  #   signing + verifier checkpoint, approvals)
+├── docs/adr/                      # ADR-001…006 + index (FastAPI, Postgres, Redis, no-OPA, no-K8s, why-not page)
 ├── policies/
 │   ├── example-policy.yaml
-│   └── revisions/                   # append-only snapshots, one file per policy version
+│   ├── demo-policy.yaml           # minted by scripts/run_demo.py
+│   └── revisions/                 # append-only policy snapshots, one file per version (gitignored)
+├── sample_target/                 # deliberately vulnerable demo MCP servers
+│   ├── overscoped_server.py       # exposes tools a low-priv identity shouldn't see
+│   └── rogue_server.py            # POST /_admin/apply_mutation mutates its own schema on demand
+├── scripts/
+│   ├── generate_api_key.py
+│   ├── generate_signing_key.py    # one-time audit ECDSA keypair; gateway fails startup without it
+│   ├── run_demo.py                # record-ready demo driver
+│   ├── seed_policies.py
+│   ├── audit_verifier_daemon.py   # incremental checkpointed verification (the compose sidecar)
+│   └── verify_audit_chain.py      # full chain walk + --diff-policy revision diffing
 ├── services/
 │   ├── gateway/
-│   │   ├── main.py                # FastAPI app entrypoint
-│   │   ├── session_manager.py     # per-client session lifecycle
-│   │   ├── jsonrpc_interceptor.py # method dispatch: initialize / tools_list / tools_call
-│   │   ├── policy_engine.py       # loads YAML, evaluates identity → allowed tools, ABAC conditions, versioning
-│   │   ├── risk_engine.py         # scores each tools/call, returns allow/challenge/human_approval/deny
-│   │   ├── schema_pruner.py       # strips unauthorized tools from tools/list response
-│   │   ├── drift_detector.py      # hash-compares live schema vs cached baseline, classifies severity
-│   │   ├── param_validator.py     # JSON Schema validation + sanitization on tools/call args
+│   │   ├── main.py                # FastAPI app + admin endpoints
+│   │   ├── session_manager.py     # per-client session lifecycle (Streamable HTTP ⇄ stdio subprocess)
+│   │   ├── jsonrpc_interceptor.py # method dispatch + §4.2 pipeline wiring
+│   │   ├── auth.py                # API key → identity, hash-and-lookup
 │   │   ├── replay_guard.py        # nonce + timestamp window dedup via Redis
-│   │   ├── auth.py                # API key verification, identity resolution
-│   │   ├── audit_log.py           # hash-chain writer + ECDSA signer + verifier
-│   │   ├── policy_simulator.py    # replays historical audit events against a candidate policy
-│   │   └── upstream_client.py     # manages connections to real MCP servers (stdio/SSE)
-│   └── audit_verifier/
-│       └── daemon.py               # standalone process, periodically re-walks the hash chain
-├── sample_target/                  # deliberately vulnerable demo MCP server
-│   ├── overscoped_server.py         # exposes tools a low-priv identity shouldn't see
-│   └── rogue_server.py              # exposes POST /_admin/apply_mutation to mutate its own schema on demand (not a timer — see the demo script below)
+│   │   ├── policy_engine.py       # YAML load, RBAC grants, admin flags
+│   │   ├── abac.py                # constrained ABAC expression evaluator (ADR-004)
+│   │   ├── policy_versions.py     # version stamping, revision snapshots, rollback
+│   │   ├── drift_detector.py      # baseline hashing + severity classification
+│   │   ├── risk_engine.py         # fixed factor-list scoring + approval-driven decay
+│   │   ├── param_validator.py     # JSON Schema validation + sanitization
+│   │   ├── schema_cache.py        # shared Redis TTL/ETag schema cache
+│   │   ├── schema_pruner.py       # identity-scoped tools/list
+│   │   ├── audit_log.py           # hash-chain writer + ECDSA signing
+│   │   ├── audit_verifier.py      # shared incremental verification logic
+│   │   ├── approvals.py           # human-approval lifecycle (one-time redemption)
+│   │   ├── decision_explainer.py  # GET /admin/decisions/{seq} + dry-run explain
+│   │   ├── policy_simulator.py    # POST /admin/policy/simulate historical replay
+│   │   ├── upstream_client.py     # stdio subprocess management
+│   │   └── (config.py, db.py, decision.py, signing.py, logging_config.py — support modules)
+│   └── audit_verifier/daemon.py   # sidecar entrypoint wrapper
 ├── tests/
-│   ├── unit/
-│   ├── integration/
-│   ├── adversarial/                 # rug-pull simulation, poisoned-description injection, replay attacks
-│   └── benchmarks/                  # latency/throughput measurements, checked into CI as a report artifact
-├── docs/adr/
-│   ├── ADR-001-fastapi.md
-│   ├── ADR-002-postgres-vs-dynamodb.md
-│   ├── ADR-003-redis.md
-│   └── ADR-004-no-opa-for-v1.md
-├── scripts/
-│   ├── seed_policies.py
-│   └── verify_audit_chain.py
-├── docker-compose.yml
+│   ├── unit/ · integration/ · adversarial/   # adversarial: rug pulls, poisoning, replay, TOCTOU, fork
+│   └── benchmarks/                # asyncio latency harness; reports gitignored, CI uploads artifact
+├── docker-compose.yml             # gateway + postgres + redis + verifier sidecar + rogue admin endpoint
 ├── Dockerfile
-├── pyproject.toml
-├── alembic/
 ├── .env.example
-├── LICENSE (MIT)
-└── README.md
+└── pyproject.toml
 ```
 
 ---
 
-
----
-
-## Running the demo (Phase 2: schema pruning + drift blocking)
+## Running the demo (schema pruning + drift blocking)
 
 ```bash
 python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
@@ -148,26 +197,28 @@ successful `send_email` call, waits for the operator's curl, then shows the drif
 classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call
 succeeding with the new required `bcc`, and finishes with the hash-chained audit
 receipts. (The driver wipes the local dev audit chain and drift baselines at start so
-reruns are repeatable.) The rest of the narrative below arrives with Phase 3.
+reruns are repeatable.) The full seven-step narrative in the recording script below —
+risk scoring, human approval, decision explanation, replay protection, policy
+simulation — is live as of Phase 3; the driver script covers the pruning + drift arc.
 
 ---
 
 ## Performance
 
-Measured (not estimated — see `ARCHITECTURE.md` §9) on **2026-07-07** at commit **`1fc3617`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, with Postgres 16 and Redis 7 in local Docker. Every implemented pipeline stage was active: Replay Guard → auth → RBAC → drift check → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing. (The Risk Engine is a Phase 3 stub and is not in these numbers.)
+Measured (not estimated — see `ARCHITECTURE.md` §9) on **2026-07-10** at commit **`902341f`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, with Postgres 16 and Redis 7 in local Docker. The full §4.2 pipeline was active: Replay Guard → auth → RBAC + ABAC conditions → drift check → Risk Engine scoring (all eight factors, Redis-backed behavioral counters included) → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing.
 
 Method: N=1000 sequential `tools/call` round trips via the MCP client SDK, timed with `time.perf_counter()`; direct = stdio client straight at `sample_target/overscoped_server.py`, gateway = the same calls through one in-process gateway. Overhead = gateway − direct. Cold cache = the Redis schema key deleted before every timed call, forcing an upstream `tools/list` re-fetch + drift check per call (the direct path has no cache, so its column repeats the baseline). Concurrency levels run 20 calls per session against the single gateway process, each session owning its own upstream stdio subprocess. Latencies are mean / p50 / p95 / p99.
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 1.48 / 1.39 / 1.75 / 3.93 ms | 11.45 / 10.86 / 16.42 / 20.49 ms | 9.97 / 9.47 / 14.67 / 16.56 ms |
-| Single call, cold schema cache | 1.48 / 1.39 / 1.75 / 3.93 ms | 13.93 / 13.36 / 19.23 / 24.77 ms | — |
-| 10 concurrent sessions (p95) | — | 67.99 ms | — |
-| 50 concurrent sessions (p95) | — | 493.49 ms | — |
-| 100 concurrent sessions (p95) | — | 2360.41 ms | — |
+| Single call, cached schema | 1.38 / 1.33 / 1.56 / 1.94 ms | 13.47 / 12.95 / 16.12 / 24.46 ms | 12.09 / 11.62 / 14.56 / 22.51 ms |
+| Single call, cold schema cache | 1.38 / 1.33 / 1.56 / 1.94 ms | 16.62 / 16.17 / 19.51 / 24.71 ms | — |
+| 10 concurrent sessions (p95) | — | 160.20 ms | — |
+| 50 concurrent sessions (p95) | — | 565.46 ms | — |
+| 100 concurrent sessions (p95) | — | 1228.23 ms | — |
 | `tools/list` payload size (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
 
-Peak RSS after the 100-session run: 219 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by per-session stdio subprocesses — the known ceilings discussed in `ARCHITECTURE.md` §10.
+Peak RSS after the 100-session run: 220 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by per-session stdio subprocesses — the known ceilings discussed in `ARCHITECTURE.md` §10.
 
 Reproduce: `docker compose up -d postgres redis && .venv/bin/python -m tests.benchmarks.run` (wipes the local dev audit chain, like the integration tests; per-run reports land in gitignored `tests/benchmarks/reports/`).
 
@@ -192,8 +243,11 @@ Recording script — a single continuous story rather than a feature checklist:
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
 
-As of Phase 3 (items 16–20), steps 1–6 are fully live — including the Risk Engine flag in step 3 and step 4's `GET /admin/decisions/{id}` Decision Explanation endpoint; `scripts/run_demo.py` drives the pruning + drift-blocking arc, and only the simulation in step 7 remains (Phase 3, item 21).
+All seven steps are fully live as of Phase 3 (items 16–21), including step 7's `POST /admin/policy/simulate`; `scripts/run_demo.py` drives the pruning + drift-blocking arc. The screen recording of the full narrative is the one outstanding operator step (ROADMAP item 28).
 
 ---
 
+## Roadmap
+
+[`ROADMAP.md`](./ROADMAP.md) is the four-phase build order, kept as a living checklist — Phases 1–3 (items 1–23, core gateway → hardening → risk/policy features) are complete; Phase 4 is the production-infra and finalization tail. Its closing "[Beyond v1 — documented, not built](./ROADMAP.md#beyond-v1--documented-not-built-item-29)" section records the six deliberately deferred features (OAuth 2.1 On-Behalf-Of, OPA/Cedar, real step-up auth, admin UI, two-person policy activation, multi-server trust scoring) with the trigger that would justify building each.
 
