@@ -178,7 +178,7 @@ securmcp/
 
 ---
 
-## Running the demo (schema pruning + drift blocking)
+## Running the demo (the full recording-script narrative)
 
 ```bash
 python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
@@ -189,17 +189,20 @@ POLICY_FILE=policies/demo-policy.yaml \
   docker compose up -d --build
 # when the driver prompts — the rug pull, deliberately on screen:
 curl -X POST localhost:9800/_admin/apply_mutation
+# when the driver prompts again — activate the tightened v2 draft for the simulation finale:
+docker kill -s HUP securemcp-gateway-1
 ```
 
 The driver connects as `developer` (sees only `send_email`/`read_inbox` — the destructive
 `delete_mailbox` is absent, not marked), then as `ops-admin` (sees all three), makes a
 successful `send_email` call, waits for the operator's curl, then shows the drift being
 classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call
-succeeding with the new required `bcc`, and finishes with the hash-chained audit
-receipts. (The driver wipes the local dev audit chain and drift baselines at start so
-reruns are repeatable.) The full seven-step narrative in the recording script below —
-risk scoring, human approval, decision explanation, replay protection, policy
-simulation — is live as of Phase 3; the driver script covers the pruning + drift arc.
+succeeding with the new required `bcc`, a byte-identical replay of that call blocked
+(`DENY_REPLAY`), and — after the operator's SIGHUP hot-loads a tightened v2 policy — a
+Policy Simulation replaying the demo's own traffic against v2 (`would_now_deny: 3`, the
+three `send_email` calls just made), finishing with the hash-chained audit receipts.
+(The driver wipes the local dev audit chain, drift baselines, and risk counters at
+start so reruns are repeatable.)
 
 ---
 
@@ -243,7 +246,7 @@ Recording script — a single continuous story rather than a feature checklist:
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
 
-All seven steps are fully live as of Phase 3 (items 16–21), including step 7's `POST /admin/policy/simulate`; `scripts/run_demo.py` drives the pruning + drift-blocking arc. The screen recording of the full narrative is the one outstanding operator step (ROADMAP item 28).
+All seven steps are fully live and `scripts/run_demo.py` drives the entire narrative end to end — the operator supplies two on-camera actions (the mutation curl and the v2 SIGHUP). The screen recording itself is the one outstanding operator step (ROADMAP item 28).
 
 ---
 
