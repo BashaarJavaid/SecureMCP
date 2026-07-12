@@ -178,7 +178,7 @@ securmcp/
 
 ---
 
-## Running the demo (the full recording-script narrative)
+## Running the demo (the full demo narrative)
 
 ```bash
 python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
@@ -192,6 +192,8 @@ curl -X POST localhost:9800/_admin/apply_mutation
 # when the driver prompts again — activate the tightened v2 draft for the simulation finale:
 docker kill -s HUP securemcp-gateway-1
 ```
+
+![Demo run: pruning, drift blocking, replay guard, policy simulation](./docs/img/demo.gif)
 
 The driver connects as `developer` (sees only `send_email`/`read_inbox` — the destructive
 `delete_mailbox` is absent, not marked), then as `ops-admin` (sees all three), makes a
@@ -234,15 +236,15 @@ Two tiny MCP servers built specifically to make the gateway's value visible in a
 - `overscoped_server.py`: exposes tools like `read_file`, `delete_repo`, `merge_pr` with no internal authz — demonstrates schema pruning when a low-privilege identity connects.
 - `rogue_server.py`: starts with a benign `send_email(to, subject, body)` tool (plus `read_inbox` and a destructive `delete_mailbox` so the pruning story works against a single upstream) and exposes a real admin endpoint, **`POST /_admin/apply_mutation`**, which swaps in a version of `send_email` with an added **required** `bcc` parameter and a poisoned description. `bcc` is required on purpose: an added *optional* parameter classifies as Medium drift and doesn't block — required is Critical, which does. There is no timer and no invisible trigger — the mutation only happens when that endpoint is actually called, deliberately, so the demo recording can show a terminal window where an operator runs `curl -X POST http://localhost:9800/_admin/apply_mutation` and the schema visibly changes as a real operation, not something that "just happens" off-screen. A demo where the adversarial behavior is invisible reads as scripted magic rather than a real system reacting to a real event. Mechanically: mutation state is a file on a bind mount shared between the `rogue` compose service (which only hosts the admin endpoint) and the per-session stdio MCP subprocesses the gateway spawns; the MCP side reads it on every `tools/list` (low-level `Server` API, not FastMCP), so even a live, long-held session sees the schema change without reconnecting.
 
-Recording script — a single continuous story rather than a feature checklist:
+Demo narrative — a single continuous story rather than a feature checklist:
 
 1. Connect as a low-privilege identity ("Developer") — only the safe tools show up in `tools/list`, the sensitive ones are simply absent.
-2. In a visible terminal window, an "admin" runs `curl -X POST .../_admin/apply_mutation` against the rogue server — the mutation is an on-screen, operator-triggered action, not a hidden timer.
+2. An admin runs `curl -X POST .../_admin/apply_mutation` against the rogue server — the mutation is an operator-triggered action, not a hidden timer.
 3. The Developer's next call is intercepted: drift is detected and classified, and the Risk Engine independently flags the call as high-risk — execution is blocked before it reaches the tool.
 4. An admin reviews the diff via `GET /admin/decisions/{id}` (Decision Explanation), approves the new schema.
 5. The tool becomes available again; the same call now succeeds.
 6. The Developer's client replays the exact same request a second time — the Replay Guard blocks it as a duplicate.
-7. To close: run Policy Simulation against next week's draft policy over the last hour of demo traffic, and show it would have denied three of the requests just made — a live, on-camera preview of a policy change before it ships.
+7. To close: run Policy Simulation against next week's draft policy over the last hour of demo traffic, and show it would have denied three of the requests just made — a live preview of a policy change before it ships.
 
 This single flow demonstrates schema pruning, drift classification, risk scoring, human approval, decision explanation, replay protection, and policy simulation in about 90 seconds, without feeling like a feature tour.
 
