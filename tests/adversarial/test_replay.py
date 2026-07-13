@@ -1,5 +1,7 @@
 """ARCHITECTURE.md §11: simulate a replay attack — identical nonce+timestamp
-resubmitted must be DENY_REPLAY, and a timestamp outside the window must be denied."""
+resubmitted must be DENY_REPLAY, and a timestamp outside the window must be denied.
+These identities are `bearer` (item 34): a volunteered nonce is fully enforced, and
+a stock client sending none at all still completes its call."""
 
 import time
 import uuid
@@ -49,10 +51,23 @@ async def test_timestamp_outside_window_is_denied(gateway: Gateway) -> None:
         assert excinfo.value.error.data["event_type"] == "DENY_REPLAY"
 
 
-async def test_missing_nonce_fails_closed(gateway: Gateway) -> None:
+async def test_malformed_nonce_fails_closed(gateway: Gateway) -> None:
+    # A bearer client that volunteers the pair gets it fully enforced (item 34):
+    # present-but-garbage is a deny, never a silent skip.
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
         with pytest.raises(McpError) as excinfo:
             await session.call_tool(
-                "echo", {"text": "bare"}, meta={NONCE_META_KEY: None, TIMESTAMP_META_KEY: None}
+                "echo",
+                {"text": "bare"},
+                meta={NONCE_META_KEY: "not-a-uuid", TIMESTAMP_META_KEY: "yesterday"},
             )
         assert excinfo.value.error.data["event_type"] == "DENY_REPLAY"
+
+
+async def test_stock_client_without_meta_completes_tools_call(gateway: Gateway) -> None:
+    # Item 34 verify: a stock SDK client sending no securmcp _meta at all makes a
+    # successful tools/call under bearer — the client-compatibility half of the item.
+    async with connect(gateway.url, gateway.keys["agent-full"]) as session:
+        result = await session.call_tool("echo", {"text": "no meta"})
+        assert isinstance(result.content[0], TextContent)
+        assert result.content[0].text == "no meta"

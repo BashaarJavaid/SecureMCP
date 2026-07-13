@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 from types import SimpleNamespace
@@ -427,11 +428,52 @@ async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
     assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
 
 
-async def test_missing_nonce_is_denied_before_rbac() -> None:
-    # Replay is pipeline stage 1 (§4.2): even an RBAC-denied tool reports DENY_REPLAY.
+async def test_malformed_nonce_is_denied_before_rbac() -> None:
+    # Replay is pipeline stage 1 (§4.2): a volunteered-but-malformed nonce reports
+    # DENY_REPLAY even for an RBAC-denied tool (present → fully enforced, item 34).
     interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
-        request("tools/call", {"name": "delete_repo", "arguments": {}, "_meta": {}})
+        request(
+            "tools/call",
+            {"name": "delete_repo", "arguments": {}, "_meta": {NONCE_META_KEY: "not-a-uuid"}},
+        )
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+    assert writer.events == [EventType.DENY_REPLAY]
+
+
+async def test_bearer_call_without_nonce_skips_replay_and_forwards() -> None:
+    # Item 34: a stock MCP client sends no securmcp _meta at all — bearer identities
+    # skip stage 1 entirely and the rest of the pipeline still runs.
+    interceptor, writer, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": {}})
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]
+
+
+async def test_signed_identity_missing_nonce_is_denied() -> None:
+    # For signed identities the nonce/timestamp pair stays mandatory (item 34).
+    os.environ["INTERCEPTOR_TEST_SECRET"] = "s3cret"
+    policy = PolicyFile.model_validate(
+        {
+            "version": 1,
+            "identities": [
+                {
+                    "id": "agent-readonly",
+                    "auth_mode": "signed",
+                    "key_id": "kid_interceptor",
+                    "signing_secret_env": "INTERCEPTOR_TEST_SECRET",
+                    "allowed_servers": [{"server_id": "default", "allowed_tools": ["echo"]}],
+                }
+            ],
+        }
+    )
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": {}})
     )
     assert isinstance(outcome, Respond)
     assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"

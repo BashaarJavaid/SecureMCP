@@ -14,6 +14,7 @@ from tests.integration.conftest import (  # noqa: F401  (fixtures re-exported)
     clean_audit,
     gateway,
     running_gateway,
+    signed_gateway,
 )
 
 MUTABLE_SERVER = Path(__file__).parent / "fixtures" / "mutable_server.py"

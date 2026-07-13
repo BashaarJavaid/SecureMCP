@@ -10,7 +10,7 @@ from mcp import ClientSession, McpError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
-from tests.integration.conftest import Gateway, ReplayCompliantSession
+from tests.integration.conftest import Gateway
 
 
 @asynccontextmanager
@@ -24,7 +24,7 @@ async def connect(url: str, api_key: str) -> AsyncIterator[ClientSession]:
             write,
             _,
         ):
-            async with ReplayCompliantSession(read, write) as session:
+            async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
 

@@ -1,8 +1,9 @@
 """FastAPI app entrypoint."""
 
 import asyncio
+import json
 import signal
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -360,20 +361,70 @@ async def simulate_policy(
     return result.model_dump(mode="json")
 
 
+async def _buffer_body(receive: Receive) -> tuple[bytes, Receive]:
+    """Drain the request body so the edge can verify a signed message before the
+    transport parses it, returning a replayable receive (item 34)."""
+    events: list[MutableMapping[str, Any]] = []
+    chunks: list[bytes] = []
+    while True:
+        event = await receive()
+        events.append(event)
+        if event["type"] != "http.request":
+            break
+        chunks.append(event.get("body", b""))
+        if not event.get("more_body"):
+            break
+
+    async def replay() -> MutableMapping[str, Any]:
+        if events:
+            return events.pop(0)
+        return await receive()
+
+    return b"".join(chunks), replay
+
+
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport."""
     manager: SessionManager = scope["app"].state.session_manager
     headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
     session_id = headers.get(MCP_SESSION_ID_HEADER)
+    engine = scope["app"].state.policy_store.engine
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
-    identity_id = await auth.resolve_identity_tracked(
-        headers.get(KEY_HEADER),
-        scope["app"].state.policy_store.engine,
-        scope["app"].state.redis,
-    )
+    # Bearer: the key header, hash-and-lookup. Signed (item 34): no header — the
+    # POSTed message carries key id + HMAC in params._meta, verified here at the
+    # edge so a forged signature is an HTTP 401, never a parsed session message.
+    if headers.get(KEY_HEADER) is not None:
+        identity_id = await auth.resolve_identity_tracked(
+            headers.get(KEY_HEADER), engine, scope["app"].state.redis
+        )
+    elif scope["method"] == "POST":
+        body, receive = await _buffer_body(receive)
+        try:
+            message = json.loads(body)
+        except ValueError:
+            message = None
+        identity_id = None
+        if isinstance(message, dict):
+            identity_id = await auth.verify_signed_request_tracked(
+                message, engine, scope["app"].state.redis
+            )
+    else:
+        # GET (SSE stream) / DELETE carry no JSON-RPC body to sign. A signed
+        # session was created by a signature-verified initialize, so possession of
+        # its session id binds these to that identity (residual exposure — reading
+        # the response stream off a captured session id — is documented, item 34).
+        identity_id = None
+        if session_id is not None:
+            session = manager.get(session_id)
+            if session is not None:
+                identity = engine.identity(session.interceptor.identity_id)
+                if identity is not None and identity.auth_mode == "signed":
+                    identity_id = session.interceptor.identity_id
     if identity_id is None:
-        await Response("invalid or missing API key", status_code=401)(scope, receive, send)
+        await Response("invalid or missing API key or signature", status_code=401)(
+            scope, receive, send
+        )
         return
 
     if session_id is not None:

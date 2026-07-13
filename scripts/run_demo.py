@@ -1,19 +1,24 @@
 """Recorded demo driver (ROADMAP item 8: pruning; item 14 adds drift blocking;
 item 28's recording adds the replay-guard and policy-simulation beats).
 
-Mints two API keys, writes policies/demo-policy.yaml (gitignored — keys never enter
-the repo), then drives the full README recording-script narrative against the
-dockerized gateway: identity-scoped pruning, a successful call, an ON-SCREEN operator
-mutation of the rogue server (curl, no timer), drift classified Critical and blocked,
-admin re-approval, the same call succeeding, an exact replay of that call blocked by
-the Replay Guard, and a Policy Simulation of a tightened v2 draft over the traffic
-just generated — finishing with the audit-log receipts.
+Mints two bearer API keys plus one signed key-id/secret pair (item 34), writes
+policies/demo-policy.yaml (gitignored — keys never enter the repo), then drives the
+full README recording-script narrative against the dockerized gateway:
+identity-scoped pruning, a successful call from a STOCK MCP client (no custom _meta
+anywhere — the bearer identities are the client-compatibility proof), an ON-SCREEN
+operator mutation of the rogue server (curl, no timer), drift classified Critical and
+blocked, admin re-approval, the same call succeeding, a captured `signed` request
+replayed byte-identically (DENY_REPLAY) and with a forged fresh nonce (401 — the
+capture holds no credential), and a Policy Simulation of a tightened v2 draft over
+the traffic just generated — finishing with the audit-log receipts.
 
 Run (mint the audit signing keypair once first — the gateway won't start without it):
     python scripts/generate_signing_key.py
     python scripts/run_demo.py
-and when prompted, in another terminal:
+and when prompted, in another terminal (the exact command, with this run's secret,
+is printed by the script):
     POLICY_FILE=policies/demo-policy.yaml \
+      SECURMCP_DEMO_SIGNING_SECRET=<printed by the script> \
       UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" \
       docker compose up -d --build
 then, when prompted again (the rug pull, visible on screen):
@@ -25,6 +30,7 @@ and for the closing simulation beat (activates the v2 draft so it gets a snapsho
 import asyncio
 import base64
 import hashlib
+import json
 import secrets
 import sys
 import time
@@ -32,6 +38,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -40,8 +47,10 @@ import redis.asyncio as aioredis  # noqa: E402
 import yaml  # noqa: E402
 from mcp import ClientSession, McpError  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
+from mcp.types import LATEST_PROTOCOL_VERSION  # noqa: E402
 from sqlalchemy import select, text  # noqa: E402
 
+from services.gateway import auth  # noqa: E402
 from services.gateway.audit_log import POINTER_KEY  # noqa: E402
 from services.gateway.config import settings  # noqa: E402
 from services.gateway.db import AuditLog, async_session, engine  # noqa: E402
@@ -73,13 +82,48 @@ def mint_key() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
-def fresh_meta() -> dict:
-    """The Replay Guard's nonce/timestamp pair (§4.8) — fresh per call."""
-    return {NONCE_META_KEY: str(uuid.uuid4()), TIMESTAMP_META_KEY: time.time()}
+SIGNED_SECRET_ENV_NAME = "SECURMCP_DEMO_SIGNING_SECRET"
+SIGNED_HEADERS = {
+    "content-type": "application/json",
+    "accept": "application/json, text/event-stream",
+}
+
+
+def signed_meta(
+    key_id: str,
+    secret: bytes,
+    method: str,
+    tool: str | None = None,
+    arguments: dict | None = None,
+) -> dict[str, Any]:
+    """The `signed` wire format (item 34): nonce/timestamp + non-secret key id + an
+    HMAC over the canonical tuple. The secret itself never travels."""
+    nonce, timestamp = str(uuid.uuid4()), int(time.time())
+    return {
+        NONCE_META_KEY: nonce,
+        TIMESTAMP_META_KEY: timestamp,
+        auth.KEY_ID_META_KEY: key_id,
+        auth.SIGNATURE_META_KEY: auth.sign_request(
+            secret, nonce, timestamp, method, tool, arguments
+        ),
+    }
+
+
+def sse_json(response: httpx.Response) -> dict[str, Any]:
+    """The transport answers POSTs as SSE; the JSON-RPC message rides a data: line."""
+    if response.headers.get("content-type", "").startswith("application/json"):
+        return response.json()
+    payload = None
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            payload = json.loads(line[len("data: ") :])
+    assert payload is not None, response.text
+    return payload
 
 
 def write_policy(
     keys: dict[str, str],
+    ci_key_id: str,
     version: int = 1,
     developer_tools: list[str] | None = None,
 ) -> None:
@@ -106,6 +150,18 @@ def write_policy(
                         "api_key_hash": key_hash("ops-admin"),
                         "admin": True,
                         "allowed_servers": [{"server_id": "*", "allowed_tools": ["*"]}],
+                    },
+                    {
+                        # Signed identity (item 34): no API key at all — the policy
+                        # holds the non-secret key id and the *name* of the env var
+                        # the gateway reads the HMAC secret from.
+                        "id": "ci-agent",
+                        "auth_mode": "signed",
+                        "key_id": ci_key_id,
+                        "signing_secret_env": SIGNED_SECRET_ENV_NAME,
+                        "allowed_servers": [
+                            {"server_id": "default", "allowed_tools": ["read_inbox"]}
+                        ],
                     },
                 ],
             }
@@ -169,10 +225,11 @@ async def connect(api_key: str) -> AsyncIterator[ClientSession]:
                 yield session
 
 
-async def wait_for_gateway(api_key: str) -> None:
+async def wait_for_gateway(api_key: str, signing_secret: str) -> None:
     print("\nWaiting for the gateway to come up with the demo policy...")
     print("  In another terminal:")
     print("    POLICY_FILE=policies/demo-policy.yaml \\")
+    print(f"      {SIGNED_SECRET_ENV_NAME}={signing_secret} \\")
     print(
         '      UPSTREAM_COMMAND="python sample_target/rogue_server.py'
         ' --state /rogue-state/state.json" \\'
@@ -225,11 +282,7 @@ async def drift_and_block(api_key: str) -> None:
 
         section("developer calls send_email — blocked at the point of action")
         try:
-            await session.call_tool(
-                "send_email",
-                {"to": "a@b.c", "subject": "hi", "body": "hello"},
-                meta=fresh_meta(),
-            )
+            await session.call_tool("send_email", {"to": "a@b.c", "subject": "hi", "body": "hello"})
             sys.exit("expected DENY_DRIFT — did the mutation apply?")
         except McpError as error:
             decision = error.error.data
@@ -252,39 +305,82 @@ async def approve_and_retry(keys: dict[str, str]) -> None:
     section("developer retries (with the now-required bcc) — allowed again")
     async with connect(keys["developer"]) as session:
         result = await session.call_tool(
-            "send_email",
-            {"to": "a@b.c", "subject": "hi", "body": "hello", "bcc": "x@y.z"},
-            meta=fresh_meta(),
+            "send_email", {"to": "a@b.c", "subject": "hi", "body": "hello", "bcc": "x@y.z"}
         )
         print(f"  {result.content[0].text}")  # type: ignore[union-attr]
 
 
-async def replay_blocked(api_key: str) -> None:
-    """README recording-script step 6: the exact same request a second time — the
-    Replay Guard dedupes the nonce, so byte-identical retries never re-execute."""
-    section("the developer's client replays the exact same request — blocked")
-    arguments = {"to": "a@b.c", "subject": "hi again", "body": "hello", "bcc": "x@y.z"}
-    meta = fresh_meta()
-    async with connect(api_key) as session:
-        await session.call_tool("send_email", arguments, meta=meta)
-        print("  first send (fresh nonce): allowed")
-        try:
-            await session.call_tool("send_email", arguments, meta=meta)
+async def replay_blocked(ci_key_id: str, ci_secret: bytes) -> None:
+    """README recording-script step 6, now the item-34 story: ci-agent is a `signed`
+    identity, so its captured request carries no credential at all. A byte-identical
+    replay dies on nonce dedup; a forged fresh nonce dies at the edge, because the
+    attacker cannot recompute the HMAC without the secret."""
+    section("a signed agent's request is captured and replayed — blocked twice over")
+    async with httpx.AsyncClient() as client:
+        init = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "ci-agent", "version": "0"},
+                "_meta": signed_meta(ci_key_id, ci_secret, "initialize"),
+            },
+        }
+        response = await client.post(f"{GATEWAY}/mcp/", headers=SIGNED_HEADERS, json=init)
+        response.raise_for_status()
+        headers = {**SIGNED_HEADERS, "mcp-session-id": response.headers["mcp-session-id"]}
+        initialized = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {"_meta": signed_meta(ci_key_id, ci_secret, "notifications/initialized")},
+        }
+        (await client.post(f"{GATEWAY}/mcp/", headers=headers, json=initialized)).raise_for_status()
+
+        arguments: dict = {}
+        call = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "read_inbox",
+                "arguments": arguments,
+                "_meta": signed_meta(ci_key_id, ci_secret, "tools/call", "read_inbox", arguments),
+            },
+        }
+        body = json.dumps(call).encode()  # the attacker's capture: headers + body
+
+        first = sse_json(await client.post(f"{GATEWAY}/mcp/", headers=headers, content=body))
+        if "result" not in first:
+            sys.exit(f"expected the signed call to be allowed, got: {first}")
+        print("  first send (signed, no API key on the wire): allowed")
+
+        replayed = sse_json(await client.post(f"{GATEWAY}/mcp/", headers=headers, content=body))
+        decision = replayed.get("error", {}).get("data", {})
+        if decision.get("event_type") != "DENY_REPLAY":
             sys.exit("expected DENY_REPLAY — identical nonce should never execute twice")
-        except McpError as error:
-            decision = error.error.data
-            print(f"  identical request replayed: event_type={decision['event_type']}")
-            print(f"  reason: {decision['reason']}")
-            print(f"  audit_id: {decision['audit_id']}")
+        print(f"  byte-identical replay: event_type={decision['event_type']}")
+        print(f"  reason: {decision['reason']}")
+        print(f"  audit_id: {decision['audit_id']}")
+
+        forged = json.loads(body)
+        forged["params"]["_meta"][NONCE_META_KEY] = str(uuid.uuid4())
+        forged["params"]["_meta"][TIMESTAMP_META_KEY] = int(time.time())
+        response = await client.post(f"{GATEWAY}/mcp/", headers=headers, json=forged)
+        if response.status_code != 401:
+            sys.exit(f"expected 401 for a forged nonce, got {response.status_code}")
+        print("  fresh nonce, captured signature: HTTP 401 — nothing in the capture")
+        print("  lets the attacker re-sign; the secret never crossed the wire.")
 
 
-async def simulate_draft_policy(keys: dict[str, str]) -> None:
+async def simulate_draft_policy(keys: dict[str, str], ci_key_id: str) -> None:
     """README recording-script step 7: preview a tightened draft policy against the
     demo traffic just generated. Activation is what records the revision snapshot the
     simulator replays against (item 19/21), so the draft is hot-loaded first — the
     simulation itself is read-only and writes nothing."""
     section("policy simulation — preview a tightened v2 policy against today's traffic")
-    write_policy(keys, version=2, developer_tools=["read_inbox"])
+    write_policy(keys, ci_key_id, version=2, developer_tools=["read_inbox"])
     print("  v2 draft written to policies/demo-policy.yaml: developer LOSES send_email.")
     print("  In another terminal:  docker kill -s HUP securemcp-gateway-1")
     print("  (hot-reloads v2 and records the revision snapshot the simulator needs)")
@@ -350,16 +446,19 @@ async def main() -> None:
     STATE_PATH.unlink(missing_ok=True)  # start from the benign schema
     await reset_dev_state()
     keys = {"developer": mint_key(), "ops-admin": mint_key()}
-    write_policy(keys)
+    ci_key_id = f"kid_{secrets.token_hex(8)}"
+    ci_secret = mint_key()
+    write_policy(keys, ci_key_id)
     print(f"\nDemo policy written to {POLICY_PATH.relative_to(Path.cwd())}")
-    print("  developer  -> allowed: send_email, read_inbox")
+    print("  developer  -> allowed: send_email, read_inbox (bearer — a stock MCP client)")
     print("  ops-admin  -> allowed: * (everything), admin: true")
+    print(f"  ci-agent   -> allowed: read_inbox (signed — key id {ci_key_id}, no key on the wire)")
     print(
         "Upstream: sample_target/rogue_server.py — starts benign, mutates only when"
         " its admin endpoint is hit."
     )
 
-    await wait_for_gateway(keys["developer"])
+    await wait_for_gateway(keys["developer"], ci_secret)
     await clear_risk_counters()  # the waiting polls above were wrong-key 401s
 
     await show_tools("developer", keys["developer"])
@@ -369,20 +468,18 @@ async def main() -> None:
     )
     await show_tools("ops-admin", keys["ops-admin"])
 
-    section("developer calls send_email — benign schema, allowed")
+    section("developer calls send_email — benign schema, allowed (stock client, no _meta)")
     async with connect(keys["developer"]) as session:
         result = await session.call_tool(
-            "send_email",
-            {"to": "a@b.c", "subject": "hi", "body": "hello"},
-            meta=fresh_meta(),
+            "send_email", {"to": "a@b.c", "subject": "hi", "body": "hello"}
         )
         print(f"  {result.content[0].text}")  # type: ignore[union-attr]
 
     await wait_for_mutation()
     await drift_and_block(keys["developer"])
     await approve_and_retry(keys)
-    await replay_blocked(keys["developer"])
-    await simulate_draft_policy(keys)
+    await replay_blocked(ci_key_id, ci_secret.encode())
+    await simulate_draft_policy(keys, ci_key_id)
     await show_audit_receipts()
     section("done")
 

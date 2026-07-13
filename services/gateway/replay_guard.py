@@ -1,13 +1,16 @@
 """Replay Guard (ARCHITECTURE.md §4.8): nonce + timestamp window dedup via Redis.
 
-Every tools/call from a compliant client carries a client-generated UUID nonce and a
-Unix-epoch-seconds timestamp in `params._meta` under the keys `securmcp/nonce` and
-`securmcp/timestamp` (MCP reserves `_meta` for exactly this kind of out-of-band
-metadata; top-level params would collide with the typed CallToolRequestParams shape).
-A timestamp outside the configurable ±window is rejected; a nonce seen before within
-the window is a replay (DENY_REPLAY). Missing or malformed fields fail closed, as does
-Redis being unreachable (§5). Deliberately no request signing beyond this pair in v1 —
-the bar is "defend against naive replay", not a fully compromised client.
+The pair travels as a client-generated UUID nonce and a Unix-epoch-seconds timestamp
+in `params._meta` under the keys `securmcp/nonce` and `securmcp/timestamp` (MCP
+reserves `_meta` for exactly this kind of out-of-band metadata; top-level params
+would collide with the typed CallToolRequestParams shape). Whether it is required is
+the identity's auth_mode (item 34): mandatory for `signed` identities, where the pair
+is also covered by the request HMAC (auth.py) so a fresh nonce cannot be re-signed;
+opportunistic for `bearer`, where a volunteered pair is fully enforced but a stock
+client sending none skips the check. When the check runs: a timestamp outside the
+configurable ±window is rejected; a nonce seen before within the window is a replay
+(DENY_REPLAY). Missing or malformed fields fail closed, as does Redis being
+unreachable (§5).
 """
 
 import time

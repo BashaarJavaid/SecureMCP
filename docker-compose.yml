@@ -34,6 +34,9 @@ services:
       # Phase 2 gets its own service — it needs an admin HTTP endpoint).
       UPSTREAM_COMMAND: ${UPSTREAM_COMMAND:-python sample_target/overscoped_server.py}
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
+      # Signed-identity secret for the demo policy's ci-agent (item 34): the YAML
+      # names this var; the value never enters the policy file or the repo.
+      SECURMCP_DEMO_SIGNING_SECRET: ${SECURMCP_DEMO_SIGNING_SECRET:-}
       # Metrics default to loopback (config.py) so a bare-host run doesn't expose
       # identity ids / tool names. Here the port is unpublished, so the compose
       # network is the boundary and Prometheus needs to reach it.

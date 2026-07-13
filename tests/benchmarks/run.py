@@ -51,7 +51,6 @@ from services.gateway.db import Base, engine
 from services.gateway.schema_cache import SchemaCache
 from tests.integration.conftest import (
     Gateway,
-    ReplayCompliantSession,
     _key_hash,
     running_gateway,
 )
@@ -121,7 +120,7 @@ async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSes
             write,
             _,
         ):
-            async with ReplayCompliantSession(read, write) as session:
+            async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
 

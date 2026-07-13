@@ -40,7 +40,7 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import abac, metrics, param_validator, schema_pruner
+from services.gateway import abac, auth, metrics, param_validator, schema_pruner
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
@@ -58,6 +58,27 @@ AUDIT_UNAVAILABLE_CODE = -32004
 
 _HANDLED_METHODS = frozenset({"initialize", "tools/list", "tools/call"})
 _REFETCH_TIMEOUT_S = 10
+
+# Gateway-facing _meta keys — consumed here, never forwarded upstream.
+_GATEWAY_META_KEYS = (
+    NONCE_META_KEY,
+    TIMESTAMP_META_KEY,
+    APPROVAL_META_KEY,
+    auth.KEY_ID_META_KEY,
+    auth.SIGNATURE_META_KEY,
+)
+
+
+def _strip_gateway_meta(params: dict[str, Any] | None) -> None:
+    if not params:
+        return
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return
+    for key in _GATEWAY_META_KEYS:
+        meta.pop(key, None)
+    if not meta:
+        params.pop("_meta", None)
 
 
 @dataclass
@@ -139,6 +160,9 @@ class Interceptor:
                 metrics.REQUEST_LATENCY.observe(time.perf_counter() - start)
         elif root.method not in _HANDLED_METHODS:
             self._log.info("passthrough_no_handler", method=root.method)
+        # Signed requests (item 34) carry key-id/signature/nonce on every method;
+        # none of the gateway's _meta keys belong upstream.
+        _strip_gateway_meta(root.params)
         return Forward(message)
 
     async def _authorize_call(
@@ -148,25 +172,34 @@ class Interceptor:
         tool_name = str(params.get("name", ""))
         arguments = params.get("arguments", {}) or {}
 
-        # Replay Guard (§4.2 stage 1, cheapest check first): nonce + timestamp from
-        # params._meta; missing/invalid fields and a Redis failure all deny (§5).
+        # Replay Guard (§4.2 stage 1, cheapest check first). Mandatory for signed
+        # identities — nonce/timestamp are members of the edge-verified signature, so
+        # a byte-identical replay dies here on dedup while a fresh nonce already died
+        # at the edge (401, unsignable). Opportunistic for bearer (item 34): a
+        # volunteered nonce/timestamp key is fully enforced (present-but-malformed
+        # denies, §5), both absent skips — that's what lets a stock MCP client call
+        # at all. Dedup is deliberately tools/call-only: replaying a captured
+        # tools/list re-reads a list, no action. Redis failure still denies (§5).
         meta = params.get("_meta") or {}
-        try:
-            replay_reason = await self.replay.check(
-                meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
-            )
-        except Exception:
-            self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
-            replay_reason = "replay guard unavailable"
-        if replay_reason is not None:
-            return await self._deny(
-                request,
-                tool_name,
-                EventType.DENY_REPLAY,
-                f"Replay detected: {replay_reason}",
-                ["replay_guard"],
-                arguments=arguments,
-            )
+        identity = self.engine.identity(self.identity_id)
+        signed_mode = identity is not None and identity.auth_mode == "signed"
+        if signed_mode or NONCE_META_KEY in meta or TIMESTAMP_META_KEY in meta:
+            try:
+                replay_reason = await self.replay.check(
+                    meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
+                )
+            except Exception:
+                self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
+                replay_reason = "replay guard unavailable"
+            if replay_reason is not None:
+                return await self._deny(
+                    request,
+                    tool_name,
+                    EventType.DENY_REPLAY,
+                    f"Replay detected: {replay_reason}",
+                    ["replay_guard"],
+                    arguments=arguments,
+                )
 
         grant = self.engine.matching_grant(self.identity_id, settings.upstream_server_id, tool_name)
         if grant is None:
@@ -316,19 +349,15 @@ class Interceptor:
         metrics.TOOL_CALLS.labels(
             self.identity_id, settings.upstream_server_id, tool_name, EventType.ALLOW.value
         ).inc()
-        # The nonce/timestamp/approval-id trio is gateway-facing only — never upstream.
-        meta.pop(NONCE_META_KEY, None)
-        meta.pop(TIMESTAMP_META_KEY, None)
-        meta.pop(APPROVAL_META_KEY, None)
-        if not meta:
-            params.pop("_meta", None)
+        _strip_gateway_meta(params)
         return Forward(message)
 
     def _abac_attributes(self, tool_name: str, meta: dict[str, Any]) -> dict[str, abac.AttrValue]:
         """The attribute universe conditions resolve against (§4.8): identity.* from
         the policy identity record (identity.id from the id itself), tool.* from the
-        current call, context.hour from the replay timestamp (already validated by
-        stage 1) in UTC. risk.score is bound later, once stage 6 has scored."""
+        current call, context.hour in UTC from the replay timestamp (already validated
+        by stage 1) or, when a bearer call carries none (item 34), the gateway's own
+        clock. risk.score is bound later, once stage 6 has scored."""
         attrs: dict[str, abac.AttrValue] = {
             "identity.id": self.identity_id,
             "tool.name": tool_name,
@@ -341,6 +370,8 @@ class Interceptor:
         timestamp = meta.get(TIMESTAMP_META_KEY)
         if not isinstance(timestamp, bool) and isinstance(timestamp, int | float):
             attrs["context.hour"] = datetime.fromtimestamp(timestamp, UTC).hour
+        else:
+            attrs["context.hour"] = datetime.now(UTC).hour
         return attrs
 
     async def _enforce_conditions(
