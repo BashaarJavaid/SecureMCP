@@ -9,9 +9,9 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
-from services.gateway import logging_config
+from services.gateway import logging_config, risk_engine
 from services.gateway.approvals import APPROVAL_META_KEY
-from services.gateway.decision import EventType
+from services.gateway.decision import DecisionOutcome, EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
@@ -683,6 +683,30 @@ async def test_risk_threshold_boundaries(score: int, expected_event: EventType) 
         data = outcome.message.message.root.error.data
         assert data["event_type"] == expected_event.value
         assert data["risk_score"] == score
+
+
+@pytest.mark.parametrize("score", [45, 75, 95])
+async def test_moved_band_constants_keep_live_and_predicted_outcomes_agreeing(
+    monkeypatch: pytest.MonkeyPatch, score: int
+) -> None:
+    """Item 32 canary: shift every band constant, then assert live enforcement still
+    matches threshold_outcome() — the mapping the Decision Explainer predicts with.
+    Each score sits where the old inline comparisons (>= 40, >= 70, > 90) and the
+    shifted bands disagree, so this fails if the interceptor ever forks them again."""
+    monkeypatch.setattr(risk_engine, "RISK_CHALLENGE_MIN", 60)
+    monkeypatch.setattr(risk_engine, "RISK_APPROVAL_MIN", 80)
+    monkeypatch.setattr(risk_engine, "RISK_DENY_ABOVE", 96)
+    predicted = risk_engine.threshold_outcome(score)
+
+    interceptor, _, _, _ = make_interceptor(risk=FakeRisk(score))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    if isinstance(outcome, Forward):
+        live = DecisionOutcome.ALLOW
+    else:
+        live = DecisionOutcome(outcome.message.message.root.error.data["decision"])
+    assert live is predicted
 
 
 async def test_human_approval_decision_carries_approval_id() -> None:

@@ -48,7 +48,7 @@ from services.gateway.decision import Decision, DecisionOutcome, EventType, Risk
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
-from services.gateway.risk_engine import RiskEngine
+from services.gateway.risk_engine import RISK_DENY_ABOVE, RiskEngine, threshold_outcome
 from services.gateway.schema_cache import SchemaCache
 
 # Implementation-defined JSON-RPC error codes; the canonical Decision object (§4.3)
@@ -266,9 +266,10 @@ class Interceptor:
             )
             if denied is not None:
                 return denied
-            if risk_score >= 40:
+            risk_outcome = threshold_outcome(risk_score)
+            if risk_outcome is not DecisionOutcome.ALLOW:
                 return await self._risk_terminal(
-                    request, tool_name, arguments, risk_score, risk_factors
+                    request, tool_name, arguments, risk_outcome, risk_score, risk_factors
                 )
 
         # Parameter validation (§4.2 stage 7, §4.8): cache miss triggers a transparent
@@ -504,27 +505,29 @@ class Interceptor:
         request: JSONRPCRequest,
         tool_name: str,
         arguments: dict[str, Any],
+        outcome: DecisionOutcome,
         risk_score: int,
         risk_factors: list[RiskFactor],
     ) -> Respond:
-        """Stage 6 terminal outcomes (§4.8 thresholds): 40-69 CHALLENGE, 70-90
-        HUMAN_APPROVAL_REQUIRED (creates the approvals row), >90 DENY_RISK. No
+        """Stage 6 terminal outcomes, branched on threshold_outcome()'s mapping —
+        the bands live only in risk_engine (item 32): CHALLENGE,
+        HUMAN_APPROVAL_REQUIRED (creates the approvals row), or DENY_RISK. No
         upstream forward in any of these; the canonical Decision travels in
         error.data with the score and contributing factors."""
-        if risk_score > 90:
+        if outcome is DecisionOutcome.DENY:
             return await self._deny(
                 request,
                 tool_name,
                 EventType.DENY_RISK,
-                f"risk score {risk_score} for {tool_name!r} exceeds the deny threshold (90)",
+                f"risk score {risk_score} for {tool_name!r} exceeds the deny"
+                f" threshold ({RISK_DENY_ABOVE})",
                 ["risk_engine"],
                 risk_score=risk_score,
                 risk_factors=risk_factors,
                 arguments=arguments,
             )
         self._pending.pop(request.id, None)
-        if risk_score >= 70:
-            outcome = DecisionOutcome.HUMAN_APPROVAL_REQUIRED
+        if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
             event_type = EventType.HUMAN_APPROVAL_REQUIRED
             reason = (
                 f"risk score {risk_score} for {tool_name!r} requires human approval;"
@@ -533,7 +536,6 @@ class Interceptor:
         else:
             # v1 challenge is terminal: a distinct error the client surfaces to a
             # human for confirmation; a real step-up auth flow is Phase 4 (§4.8).
-            outcome = DecisionOutcome.CHALLENGE
             event_type = EventType.CHALLENGE
             reason = f"risk score {risk_score} for {tool_name!r} requires confirmation"
         decision = Decision(

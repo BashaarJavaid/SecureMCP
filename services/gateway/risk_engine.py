@@ -205,16 +205,23 @@ def _denial_key(identity_id: str) -> str:
     return f"risk:denials:{identity_id}"
 
 
+# The §4.8 threshold bands: <40 continue (allow), 40-69 CHALLENGE, 70-90
+# HUMAN_APPROVAL_REQUIRED, >90 DENY. Compared only in threshold_outcome() (item 32).
+RISK_CHALLENGE_MIN = 40
+RISK_APPROVAL_MIN = 70
+RISK_DENY_ABOVE = 90
+
+
 def threshold_outcome(score: int) -> DecisionOutcome:
-    """The §4.8 threshold bands as a pure mapping: <40 continue (allow), 40-69
-    CHALLENGE, 70-90 HUMAN_APPROVAL_REQUIRED, >90 DENY. The interceptor keeps its
-    own inline branches (it also picks event types and reasons); this exists for
-    the Decision Explanation API (item 20) and its `alternative` field."""
-    if score > 90:
+    """The §4.8 threshold bands as a pure mapping — the single source of truth
+    (item 32): the interceptor branches on this for live enforcement, and the
+    Decision Explanation API (item 20) uses it for predictions and `alternative`,
+    so the two can't fork."""
+    if score > RISK_DENY_ABOVE:
         return DecisionOutcome.DENY
-    if score >= 70:
+    if score >= RISK_APPROVAL_MIN:
         return DecisionOutcome.HUMAN_APPROVAL_REQUIRED
-    if score >= 40:
+    if score >= RISK_CHALLENGE_MIN:
         return DecisionOutcome.CHALLENGE
     return DecisionOutcome.ALLOW
 
