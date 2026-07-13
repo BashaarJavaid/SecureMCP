@@ -341,7 +341,7 @@ async def explain_call(
     if error is not None:
         return deny_validation(error)
 
-    # Stage 8: ALLOW — no sanitize/forward/audit on a dry run.
+    # Stage 8: ALLOW — no forward/audit on a dry run.
     return decide(
         DecisionOutcome.ALLOW,
         EventType.ALLOW,

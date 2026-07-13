@@ -384,14 +384,6 @@ async def test_invalid_arguments_are_denied_and_audited() -> None:
     assert writer.events == [EventType.DENY_VALIDATION]
 
 
-async def test_forwarded_arguments_are_sanitized() -> None:
-    interceptor, _, _, _ = make_interceptor()
-    message = request("tools/call", {"name": "echo", "arguments": {"text": "../a\x00b"}})
-    outcome = await interceptor.on_client_message(message)
-    assert isinstance(outcome, Forward)
-    assert outcome.message.message.root.params["arguments"] == {"text": "ab"}
-
-
 async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
     interceptor, writer, cache, detector = make_interceptor(with_schema=False)
     await interceptor.on_client_message(request("tools/list", id=7))

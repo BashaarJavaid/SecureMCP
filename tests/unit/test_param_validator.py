@@ -1,7 +1,7 @@
 """ARCHITECTURE.md §11 unit criterion: param validator edge cases
 (nested objects, arrays, unicode)."""
 
-from services.gateway.param_validator import sanitize, validate
+from services.gateway.param_validator import validate
 
 ECHO_SCHEMA = {
     "type": "object",
@@ -44,36 +44,30 @@ def test_nested_objects_and_arrays_validate() -> None:
 
 
 def test_unicode_passes_untouched() -> None:
-    args = {"text": "héllo wörld — 日本語 🎌"}
-    assert validate(args, ECHO_SCHEMA) is None
-    cleaned, touched = sanitize(args)
-    assert cleaned == args
-    assert touched == []
+    assert validate({"text": "héllo wörld — 日本語 🎌"}, ECHO_SCHEMA) is None
 
 
-def test_sanitize_strips_traversal_null_bytes_and_control_chars() -> None:
-    cleaned, touched = sanitize({"text": "../../etc/passwd\x00\x1b[31m"})
-    assert cleaned["text"] == "etc/passwd[31m"
-    assert touched == ["text"]
+def test_traversal_null_bytes_and_control_chars_are_rejected() -> None:
+    for text in ("../../etc/passwd", "..\\windows\\sam", "a\x00b", "a\x1b[31m"):
+        error = validate({"text": text}, ECHO_SCHEMA)
+        assert error is not None
+        assert "'text'" in error
 
 
-def test_sanitize_preserves_newlines_and_tabs() -> None:
-    cleaned, touched = sanitize({"text": "line1\nline2\tend"})
-    assert cleaned["text"] == "line1\nline2\tend"
-    assert touched == []
+def test_reformed_traversal_is_rejected_not_reformed() -> None:
+    # Item 31: the old single-pass sanitizer turned these into '../…' and forwarded.
+    for text in ("....//etc/passwd", "..././etc/passwd"):
+        assert validate({"text": text}, ECHO_SCHEMA) is not None
 
 
-def test_sanitize_walks_nested_dicts_and_lists() -> None:
-    cleaned, touched = sanitize(
-        {"config": {"paths": ["ok", "..\\windows\\sam"], "note": "fine"}, "n": 3}
+def test_newlines_and_tabs_still_pass() -> None:
+    assert validate({"text": "line1\nline2\tend"}, ECHO_SCHEMA) is None
+
+
+def test_injection_is_found_however_nested() -> None:
+    error = validate(
+        {"config": {"paths": ["ok", "..\\windows\\sam"]}},
+        NESTED_SCHEMA,
     )
-    assert cleaned["config"]["paths"][1] == "windows\\sam"
-    assert cleaned["n"] == 3
-    assert touched == ["config.paths[1]"]
-
-
-def test_clean_arguments_come_back_unchanged() -> None:
-    args = {"a": "plain", "b": {"c": [1, 2, "three"]}}
-    cleaned, touched = sanitize(args)
-    assert cleaned == args
-    assert touched == []
+    assert error is not None
+    assert "'config.paths[1]'" in error

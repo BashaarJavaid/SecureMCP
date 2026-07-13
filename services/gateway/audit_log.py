@@ -43,6 +43,20 @@ def compute_hash(prev_hash: str, payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _jsonb_safe(value: Any) -> Any:
+    """Postgres JSONB cannot store \\u0000 in strings, and deny rows persist raw
+    attacker arguments (item 21) — escape it so a null byte can't kill the write
+    and leave a terminal unaudited. Applied before hashing, so the chain covers
+    exactly what's stored."""
+    if isinstance(value, str):
+        return value.replace("\x00", "\\u0000")
+    if isinstance(value, dict):
+        return {_jsonb_safe(k): _jsonb_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonb_safe(v) for v in value]
+    return value
+
+
 class AuditWriter:
     def __init__(
         self,
@@ -76,14 +90,16 @@ class AuditWriter:
                     try:
                         await pipe.watch(POINTER_KEY)
                         prev_hash = await self._prev_hash(pipe)
-                        payload: dict[str, Any] = {
-                            "event_type": event_type.value,
-                            "identity_id": identity_id,
-                            "server_id": settings.upstream_server_id,
-                            "tool_name": tool_name,
-                            "policy_version": self._policy_store.engine.version,
-                            **(payload_extra or {}),
-                        }
+                        payload: dict[str, Any] = _jsonb_safe(
+                            {
+                                "event_type": event_type.value,
+                                "identity_id": identity_id,
+                                "server_id": settings.upstream_server_id,
+                                "tool_name": tool_name,
+                                "policy_version": self._policy_store.engine.version,
+                                **(payload_extra or {}),
+                            }
+                        )
                         curr_hash = compute_hash(prev_hash, payload)
                         seq = await self._insert(
                             prev_hash,

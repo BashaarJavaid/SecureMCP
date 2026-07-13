@@ -30,8 +30,8 @@ APPROVAL_META_KEY = "securmcp/approval_id"
 
 
 def arguments_hash(arguments: dict[str, Any]) -> str:
-    """Canonical hash of a call's arguments, computed before sanitization both at
-    request time and at redemption so the TOCTOU comparison is apples-to-apples."""
+    """Canonical hash of a call's arguments, computed the same way at request time
+    and at redemption so the TOCTOU comparison is apples-to-apples."""
     return hashlib.sha256(canonicaljson.encode_canonical_json(arguments)).hexdigest()
 
 

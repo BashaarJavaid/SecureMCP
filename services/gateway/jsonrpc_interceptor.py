@@ -281,8 +281,6 @@ class Interceptor:
         error = param_validator.validate(arguments, input_schema)
         if error is not None:
             return await self._deny_validation(request, tool_name, arguments, error)
-        arguments, sanitized_fields = param_validator.sanitize(arguments)
-        params["arguments"] = arguments
 
         # ALLOW is recorded before the call is forwarded — no record, no action (§5).
         # matched_rules in the payload keeps GET /admin/decisions/{seq} faithful
@@ -291,8 +289,6 @@ class Interceptor:
             "arguments": arguments,
             "matched_rules": [f"policy-v{self.engine.version}:rbac"],
         }
-        if sanitized_fields:
-            payload_extra["sanitized_fields"] = sanitized_fields
         if risk_factors:
             payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         if approval_id is not None:
@@ -445,8 +441,8 @@ class Interceptor:
     ) -> Respond:
         """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
         row seq as audit_id. The deny stands even if the audit write fails.
-        arguments (raw, pre-sanitize) land in the payload so Policy Simulation can
-        replay denied calls too (item 21); rows written before then lack them."""
+        arguments land in the payload so Policy Simulation can replay denied
+        calls too (item 21); rows written before then lack them."""
         self._pending.pop(request.id, None)
         try:
             # Prior-denial-rate telemetry (§4.8, item 18): best-effort — a counting
@@ -564,8 +560,7 @@ class Interceptor:
             )
             decision.audit_id = str(seq)
             if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
-                # The approvals row references this audit seq (§4.8) — audit-first,
-                # and the hash is over the pre-sanitize arguments (see approvals.py).
+                # The approvals row references this audit seq (§4.8) — audit-first.
                 decision.approval_id = await self.approvals.create(
                     self.identity_id, tool_name, arguments_hash(arguments), seq
                 )
