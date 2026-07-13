@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     risk_freq_window_seconds: int = 60
     risk_freq_threshold: int = 10
     # Risk decay (§4.8): offset added per admin approval, behavioral factors only.
+    # Capped and expiring (item 33) so rubber-stamp approvals can dampen behavioral
+    # scoring but never permanently zero it.
     risk_decay_step: int = 5
+    risk_decay_max: int = 10
+    risk_decay_ttl_seconds: int = 2592000  # 30 days
     # Richer risk telemetry (§4.8, item 18). Prior-denial-rate: fires when an identity
     # collects more than this many DENY_* terminals within the window.
     risk_denial_window_seconds: int = 600

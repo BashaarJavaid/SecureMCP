@@ -7,8 +7,10 @@ them (a common-interface function list, deliberately not a plugin system) into a
 
 Risk decay (§4.8): a per-(identity, tool) Redis counter, incremented on each admin
 approval, discounts the *behavioral* subtotal (call frequency, prior-denial-rate,
-drift-in-review) — never the static tool-sensitivity tier — floored at 0, so
-rubber-stamp approvals can't desensitize the engine to an inherently dangerous tool.
+drift-in-review) — never the static tool-sensitivity tier — floored at 0. The
+offset is clamped to risk_decay_max at read time and the counter expires (item 33),
+so rubber-stamp approvals dampen behavioral scoring but can't switch it off, and
+never desensitize the engine to an inherently dangerous tool's static tier.
 
 Item 18 telemetry: prior-denial-rate (per-identity Redis rolling counter, bumped by
 the interceptor on every DENY_* terminal), auth-failures (the Auth Layer's gateway-
@@ -275,7 +277,8 @@ class RiskEngine:
         )
         factors = [factor for fn in FACTORS if (factor := fn(ctx)) is not None]
         decay_raw = await self._redis.get(_decay_key(identity_id, tool_name))
-        return combine(factors, int(decay_raw or 0)), factors
+        decay = min(int(decay_raw or 0), settings.risk_decay_max)
+        return combine(factors, decay), factors
 
     async def _bump_frequency(self, identity_id: str, tool_name: str) -> int:
         key = _freq_key(identity_id, tool_name)
@@ -298,5 +301,8 @@ class RiskEngine:
 
     async def apply_decay(self, identity_id: str, tool_name: str) -> None:
         """One admin approval = one calibration step (§4.8): grow this pair's offset.
-        No TTL — calibration is meant to persist, unlike the rolling counters."""
-        await self._redis.incrby(_decay_key(identity_id, tool_name), settings.risk_decay_step)
+        The TTL refreshes on every approval (item 33) so active calibration persists
+        while idle calibration ages out; score() clamps the read to risk_decay_max."""
+        key = _decay_key(identity_id, tool_name)
+        await self._redis.incrby(key, settings.risk_decay_step)
+        await self._redis.expire(key, settings.risk_decay_ttl_seconds)
