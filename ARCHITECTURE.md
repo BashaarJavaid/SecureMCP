@@ -520,17 +520,36 @@ The gateway caches two things per `(server_id)`: the last-seen tool schema set (
 
 A proxy that adds meaningful latency to every tool call is a hard sell regardless of its security value, so this gets measured and published in the README, not estimated — invented-looking numbers in a security tool's documentation are worse than no numbers at all, since a technical reviewer will assume they're fabricated the moment they can't be reproduced.
 
-- **Method:** `tests/benchmarks/` runs N=1000 `tools/call` round trips directly against `sample_target` (baseline) and through the gateway (with policy + risk engine + audit logging all active), reporting mean, p50, p95, p99, and memory footprint under concurrent load (10/50/100 simulated sessions via `locust` or a small asyncio harness). It also measures the **average `tools/list` response size reduction** from schema pruning — every other metric in this section is framed as "how much overhead does the gateway add," but pruning is a genuine positive claim: smaller wire responses and less client-side token usage for the LLM parsing the tool list. This is nearly free to capture since the benchmark suite already calls `tools/list` both directly and through the gateway.
-- **What goes in the README until the benchmark has actually been run:**
+### Method
+
+`tests/benchmarks/run.py` runs N=1000 sequential `tools/call` round trips via the MCP client SDK, timed with `time.perf_counter()`:
+
+- **direct** = stdio client straight at `sample_target/overscoped_server.py`;
+- **gateway** = the same calls through one in-process gateway, with the full §4.2 pipeline active (Replay Guard → auth → RBAC + ABAC conditions → drift check → Risk Engine scoring across all eight factors, Redis-backed behavioral counters included → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing).
+- **Overhead** = gateway − direct.
+- **Cold cache** deletes the Redis schema key before every timed call, forcing an upstream `tools/list` re-fetch plus drift check per call. The direct path has no cache, so its column repeats the baseline.
+- **Concurrency** levels run 20 calls per session against the single gateway process, each session owning its own upstream stdio subprocess.
+
+It also measures the **`tools/list` response size reduction** from schema pruning. Every other metric here answers "how much overhead does the gateway add"; pruning is the one genuine positive claim — smaller wire responses and fewer tokens for the LLM parsing the tool list.
+
+### Results
+
+Measured **2026-07-10** at commit **`902341f`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16 and Redis 7 in local Docker. Latencies are mean / p50 / p95 / p99.
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | TBD — measured on release | TBD | TBD |
-| Single call, cold schema cache | TBD | TBD | TBD |
-| 100 concurrent sessions (p95) | — | TBD | — |
-| `tools/list` payload size (avg, pruned identity) | TBD (unpruned baseline) | TBD | TBD % reduction |
+| Single call, cached schema | 1.38 / 1.33 / 1.56 / 1.94 ms | 13.47 / 12.95 / 16.12 / 24.46 ms | 12.09 / 11.62 / 14.56 / 22.51 ms |
+| Single call, cold schema cache | 1.38 / 1.33 / 1.56 / 1.94 ms | 16.62 / 16.17 / 19.51 / 24.71 ms | — |
+| 10 concurrent sessions (p95) | — | 160.20 ms | — |
+| 50 concurrent sessions (p95) | — | 565.46 ms | — |
+| 100 concurrent sessions (p95) | — | 1228.23 ms | — |
+| `tools/list` payload size (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
 
-Once the benchmark suite runs, this table is replaced with real numbers and the README states the exact commit/date they were measured against — not a one-time claim that goes stale.
+Peak RSS after the 100-session run: 220 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by the per-session stdio subprocess model — the known ceilings in §10.
+
+These numbers are published in the README with the exact commit and date they were measured at, so a stale claim is visible as stale rather than quietly wrong.
+
+**Reproduce:** `docker compose up -d postgres redis && .venv/bin/python -m tests.benchmarks.run` (wipes the local dev audit chain, like the integration tests; per-run reports land in gitignored `tests/benchmarks/reports/`).
 
 - **CI integration:** the benchmark suite runs on every merge to `main` (not every PR, to keep CI fast) and the report is uploaded as a build artifact so latency regressions are visible over time, even without a full dashboard.
 

@@ -32,7 +32,7 @@ async def main() -> int:
     once = "--once" in sys.argv
     if not once:
         # §7 failure counter scrape point (item 25); internal-only, like the gateway's.
-        start_http_server(settings.metrics_port)
+        start_http_server(settings.metrics_port, settings.metrics_host)
     try:
         while True:
             verified, failure = await verify_increment(async_session, public_key)

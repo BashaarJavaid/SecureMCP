@@ -115,8 +115,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.session_manager = manager
     # §7 metrics on a separate internal-only listener — never the published app
-    # port, since labels carry identity ids and tool names (item 25).
-    metrics_server, _ = start_http_server(settings.metrics_port)
+    # port, since labels carry identity ids and tool names (item 25). Loopback
+    # unless METRICS_HOST opens it (compose does; see config.py).
+    metrics_server, _ = start_http_server(settings.metrics_port, settings.metrics_host)
     sweep = asyncio.create_task(manager.sweep_loop())
     # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
     loop = asyncio.get_running_loop()

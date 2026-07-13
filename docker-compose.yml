@@ -34,6 +34,10 @@ services:
       # Phase 2 gets its own service — it needs an admin HTTP endpoint).
       UPSTREAM_COMMAND: ${UPSTREAM_COMMAND:-python sample_target/overscoped_server.py}
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
+      # Metrics default to loopback (config.py) so a bare-host run doesn't expose
+      # identity ids / tool names. Here the port is unpublished, so the compose
+      # network is the boundary and Prometheus needs to reach it.
+      METRICS_HOST: "0.0.0.0"
     volumes:
       # Host-editable policies: edit + `docker kill -s HUP securemcp-gateway-1` to reload.
       # Read-only so a compromised gateway can't persist a policy backdoor; only the
@@ -61,6 +65,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS:-60}
       METRICS_PORT: "9101"
+      METRICS_HOST: "0.0.0.0"
     volumes:
       # Only the public key is read; the private key never leaves the gateway process.
       - ./secrets:/app/secrets:ro

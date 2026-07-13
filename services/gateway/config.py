@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # never the published app port (labels carry identity ids and tool names).
     # The verifier sidecar sets its own via METRICS_PORT in compose.
     metrics_port: int = 9100
+    # Bind address for that listener. Loopback by default so a gateway run directly
+    # on a host does not expose identity ids and tool names on every interface;
+    # compose sets METRICS_HOST=0.0.0.0, where container network isolation (the port
+    # is deliberately not published) is the boundary instead.
+    metrics_host: str = "127.0.0.1"
 
 
 settings = Settings()
