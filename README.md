@@ -71,7 +71,7 @@ graph TD
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-**v1 fronts exactly one upstream server.** `UPSTREAM_COMMAND` is a single command and `server_id` is a single constant. The policy schema's per-server grants and `"*"` wildcards are forward-compatible structure for a server registry that does not exist yet — it's the first item in Phase 5.
+**Multiple upstreams are registered in the policy's `servers:` block** (item 35): `server_id → stdio command`, versioned and rolled back with the rest of the policy. Clients connect to `/mcp/<server_id>`; one session is bound to one upstream, chosen at connect time. RBAC grants, drift baselines, schema caches, risk counters, and approvals are all keyed on the real `server_id`, so an identically-named tool on two servers is two different tools.
 
 ---
 
@@ -102,9 +102,8 @@ python scripts/run_demo.py               # resets demo state, mints keys, writes
 ```
 
 ```bash
-# in another terminal:
+# in another terminal (the rogue upstream command lives in the demo policy's servers: block):
 POLICY_FILE=policies/demo-policy.yaml \
-  UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" \
   docker compose up -d --build
 
 # when the driver prompts — the rug pull, deliberately on screen:

@@ -24,6 +24,7 @@ logging_config.configure()
 POLICY = PolicyFile.model_validate(
     {
         "version": 1,
+        "servers": {"default": "unused-command"},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -51,6 +52,7 @@ class FakeWriter:
         self,
         event_type: EventType,
         identity_id: str,
+        server_id: str | None = None,
         tool_name: str | None = None,
         payload_extra: dict[str, Any] | None = None,
         risk_score: int | None = None,
@@ -111,7 +113,12 @@ class FakeRisk:
         self.denial_error: Exception | None = None
 
     async def score(
-        self, identity_id: str, tool_name: str, arguments: dict[str, Any], risk_policy: Any
+        self,
+        identity_id: str,
+        server_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        risk_policy: Any,
     ) -> tuple[int, list[Any]]:
         if self.error is not None:
             raise self.error
@@ -129,12 +136,14 @@ class FakeApprovals:
         self.denial: tuple[EventType, str] | None = None
 
     async def redeem(
-        self, approval_id: str, identity_id: str, tool_name: str, args_hash: str
+        self, approval_id: str, identity_id: str, server_id: str, tool_name: str, args_hash: str
     ) -> tuple[EventType, str] | None:
         self.redeemed.append(approval_id)
         return self.denial
 
-    async def create(self, identity_id: str, tool_name: str, args_hash: str, audit_id: int) -> str:
+    async def create(
+        self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
+    ) -> str:
         return "approval-1"
 
 
@@ -155,6 +164,7 @@ def make_interceptor(
         cache.data["default"] = [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
     interceptor = Interceptor(
         identity_id=identity,
+        server_id="default",
         session_id="test-session",
         store=cast(Any, SimpleNamespace(engine=PolicyEngine(policy or POLICY))),
         writer=cast(Any, writer),
@@ -172,6 +182,7 @@ def abac_policy(conditions: list[str], attributes: dict[str, Any] | None = None)
     return PolicyFile.model_validate(
         {
             "version": 1,
+            "servers": {"default": "unused-command"},
             "identities": [
                 {
                     "id": "agent-readonly",
@@ -460,6 +471,7 @@ async def test_signed_identity_missing_nonce_is_denied() -> None:
     policy = PolicyFile.model_validate(
         {
             "version": 1,
+            "servers": {"default": "unused-command"},
             "identities": [
                 {
                     "id": "agent-readonly",

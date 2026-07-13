@@ -57,7 +57,7 @@ async def handshake(client: httpx.AsyncClient, gw: SignedGateway) -> dict[str, s
             "_meta": signed_meta(gw, "initialize"),
         },
     }
-    response = await client.post(f"{gw.url}/mcp/", headers=HEADERS, json=init)
+    response = await client.post(f"{gw.url}/mcp/default", headers=HEADERS, json=init)
     assert response.status_code == 200, response.text
     headers = {**HEADERS, "mcp-session-id": response.headers["mcp-session-id"]}
     initialized = {
@@ -65,7 +65,7 @@ async def handshake(client: httpx.AsyncClient, gw: SignedGateway) -> dict[str, s
         "method": "notifications/initialized",
         "params": {"_meta": signed_meta(gw, "notifications/initialized")},
     }
-    response = await client.post(f"{gw.url}/mcp/", headers=headers, json=initialized)
+    response = await client.post(f"{gw.url}/mcp/default", headers=headers, json=initialized)
     assert response.status_code in (200, 202), response.text
     return headers
 
@@ -91,11 +91,11 @@ async def test_captured_signed_request_cannot_be_replayed(signed_gateway: Signed
         headers = await handshake(client, gw)
         body = signed_call_body(gw, "captured")  # the attacker's capture: headers + body
 
-        first = await client.post(f"{gw.url}/mcp/", headers=headers, content=body)
+        first = await client.post(f"{gw.url}/mcp/default", headers=headers, content=body)
         assert "result" in sse_json(first), first.text  # the original call executed
 
         # Byte-identical resubmission: valid signature, dead nonce.
-        replay = await client.post(f"{gw.url}/mcp/", headers=headers, content=body)
+        replay = await client.post(f"{gw.url}/mcp/default", headers=headers, content=body)
         error = sse_json(replay)["error"]
         assert error["data"]["event_type"] == "DENY_REPLAY"
         assert error["data"]["decision"] == "deny"
@@ -106,7 +106,7 @@ async def test_captured_signed_request_cannot_be_replayed(signed_gateway: Signed
         fresh["params"]["_meta"][NONCE_META_KEY] = str(uuid.uuid4())
         fresh["params"]["_meta"][TIMESTAMP_META_KEY] = int(time.time())
         forged = await client.post(
-            f"{gw.url}/mcp/", headers=headers, content=json.dumps(fresh).encode()
+            f"{gw.url}/mcp/default", headers=headers, content=json.dumps(fresh).encode()
         )
         assert forged.status_code == 401
 
@@ -119,7 +119,9 @@ async def test_tampered_arguments_are_rejected_at_the_edge(
         headers = await handshake(client, gw)
         call = json.loads(signed_call_body(gw, "benign"))
         call["params"]["arguments"] = {"text": "tampered"}
-        response = await client.post(f"{gw.url}/mcp/", headers=headers, content=json.dumps(call))
+        response = await client.post(
+            f"{gw.url}/mcp/default", headers=headers, content=json.dumps(call)
+        )
         assert response.status_code == 401
 
 
@@ -145,6 +147,6 @@ async def test_unknown_key_id_gets_no_session(signed_gateway: SignedGateway) -> 
         },
     }
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{gw.url}/mcp/", headers=HEADERS, json=init)
+        response = await client.post(f"{gw.url}/mcp/default", headers=HEADERS, json=init)
         assert response.status_code == 401
         assert "mcp-session-id" not in response.headers

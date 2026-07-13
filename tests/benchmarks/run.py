@@ -90,7 +90,7 @@ async def preflight_clean() -> None:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     try:
         await redis_client.ping()
-        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
+        await redis_client.delete(POINTER_KEY, "schema:default")
     except Exception:
         sys.exit(f"redis not reachable — {remedy}")
     finally:
@@ -115,7 +115,7 @@ async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSes
         follow_redirects=True,
         timeout=httpx.Timeout(300.0),
     ) as http_client:
-        async with streamable_http_client(f"{gw.url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(f"{gw.url}/mcp/default", http_client=http_client) as (
             read,
             write,
             _,
@@ -180,11 +180,7 @@ async def bench_single_call(gw: Gateway, n: int) -> dict[str, dict[str, float]]:
             call = functools.partial(session.call_tool, "read_file", {"path": "bench.txt"})
             await timed_calls(call, WARMUP_CALLS)
             gateway = dist(await timed_calls(call, n))
-            cold = dist(
-                await timed_calls(
-                    call, n, before_each=lambda: cache.invalidate(settings.upstream_server_id)
-                )
-            )
+            cold = dist(await timed_calls(call, n, before_each=lambda: cache.invalidate("default")))
     finally:
         await redis_client.aclose()
     return {"direct": direct, "gateway_cached": gateway, "gateway_cold": cold}

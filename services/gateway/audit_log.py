@@ -26,7 +26,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.gateway import signing
-from services.gateway.config import settings
 from services.gateway.db import AuditLog
 from services.gateway.decision import EventType
 from services.gateway.policy_engine import PolicyStore
@@ -78,6 +77,7 @@ class AuditWriter:
         self,
         event_type: EventType,
         identity_id: str,
+        server_id: str | None = None,
         tool_name: str | None = None,
         payload_extra: dict[str, Any] | None = None,
         risk_score: int | None = None,
@@ -94,7 +94,7 @@ class AuditWriter:
                             {
                                 "event_type": event_type.value,
                                 "identity_id": identity_id,
-                                "server_id": settings.upstream_server_id,
+                                "server_id": server_id,
                                 "tool_name": tool_name,
                                 "policy_version": self._policy_store.engine.version,
                                 **(payload_extra or {}),
@@ -107,6 +107,7 @@ class AuditWriter:
                             payload,
                             event_type,
                             identity_id,
+                            server_id,
                             tool_name,
                             risk_score,
                         )
@@ -138,6 +139,7 @@ class AuditWriter:
         payload: dict[str, Any],
         event_type: EventType,
         identity_id: str,
+        server_id: str | None,
         tool_name: str | None,
         risk_score: int | None,
     ) -> int:
@@ -147,7 +149,7 @@ class AuditWriter:
                 curr_hash=curr_hash,
                 signature=signing.sign(self._signing_key, curr_hash),
                 identity_id=identity_id,
-                server_id=settings.upstream_server_id,
+                server_id=server_id,
                 tool_name=tool_name,
                 policy_version=self._policy_store.engine.version,
                 event_type=event_type.value,

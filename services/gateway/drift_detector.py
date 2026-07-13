@@ -142,6 +142,7 @@ class DriftDetector:
                 await self._writer.write(
                     severity.event,
                     identity_id,
+                    server_id=server_id,
                     tool_name=name,
                     payload_extra={
                         "severity": severity.name.lower(),
@@ -163,6 +164,7 @@ class DriftDetector:
                     await self._writer.write(
                         EventType.DRIFT_MEDIUM,
                         identity_id,
+                        server_id=server_id,
                         tool_name=name,
                         payload_extra={"severity": "medium", "removed": True},
                     )
@@ -206,6 +208,7 @@ class DriftDetector:
         await self._writer.write(
             EventType.DRIFT_CRITICAL,
             identity_id,
+            server_id=server_id,
             tool_name=name,
             payload_extra={
                 "severity": "critical",
@@ -294,6 +297,7 @@ class DriftDetector:
             seq = await self._writer.write(
                 EventType.APPROVED,
                 approved_by,
+                server_id=server_id,
                 tool_name=tool_name,
                 payload_extra={"old_hash": old_hash, "new_hash": row.approved_hash},
             )

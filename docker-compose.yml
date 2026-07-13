@@ -30,9 +30,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      # stdio upstream, spawned per session inside this container (rogue_server in
-      # Phase 2 gets its own service — it needs an admin HTTP endpoint).
-      UPSTREAM_COMMAND: ${UPSTREAM_COMMAND:-python sample_target/overscoped_server.py}
+      # Upstream stdio commands live in the policy's `servers:` block (item 35),
+      # spawned per session inside this container.
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
       # Signed-identity secret for the demo policy's ci-agent (item 34): the YAML
       # names this var; the value never enters the policy file or the repo.
@@ -79,7 +78,7 @@ services:
   # Rogue-demo admin endpoint (item 14): mutation is a real, operator-triggered call —
   # curl -X POST localhost:9800/_admin/apply_mutation — never a timer. The rogue MCP
   # server itself runs as per-session stdio subprocesses inside the gateway container
-  # (set UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json");
+  # (the demo policy's `servers:` block registers it, see scripts/run_demo.py);
   # this service only hosts the mutation endpoint, sharing state via the bind mount.
   rogue:
     build: .

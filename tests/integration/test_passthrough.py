@@ -13,7 +13,9 @@ async def test_full_sequence_passes_through(gateway: Gateway) -> None:
     async with httpx.AsyncClient(
         headers={"X-SecurMCP-Key": gateway.keys["agent-full"]}, follow_redirects=True
     ) as http_client:
-        async with streamable_http_client(f"{gateway.url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(
+            f"{gateway.url}/mcp/default", http_client=http_client
+        ) as (
             read,
             write,
             _get_session_id,

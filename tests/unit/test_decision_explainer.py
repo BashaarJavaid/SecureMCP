@@ -183,6 +183,7 @@ async def explain(
     return await explain_call(
         identity,
         tool,
+        "default",
         arguments or {},
         context or {},
         engine=engine or make_engine(),

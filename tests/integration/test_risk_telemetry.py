@@ -177,13 +177,13 @@ async def test_fifty_approvals_cannot_zero_behavioral_scoring(
     try:
         engine = risk_engine.RiskEngine(redis_client, cast(Any, _DriftInReview()))
         for _ in range(50):
-            await engine.apply_decay("agent", "echo")
-        assert await redis_client.ttl("risk:decay:agent:echo") > 0  # calibration ages out
+            await engine.apply_decay("agent", "default", "echo")
+        assert await redis_client.ttl("risk:decay:agent:default:echo") > 0  # ages out
         for _ in range(4):  # past the >3-denials/window threshold
             await engine.record_denial("agent")
         score = 0
         for _ in range(11):  # past the >10-calls/window frequency threshold
-            score, _ = await engine.score("agent", "echo", {}, RiskPolicy())
+            score, _ = await engine.score("agent", "default", "echo", {}, RiskPolicy())
         assert score >= risk_engine.RISK_CHALLENGE_MIN
     finally:
         await redis_client.aclose()

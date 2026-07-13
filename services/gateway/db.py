@@ -82,6 +82,9 @@ class Approval(Base):
     approval_id: Mapped[str] = mapped_column(Text, primary_key=True)
     audit_id: Mapped[int] = mapped_column(BigInteger)
     identity_id: Mapped[str] = mapped_column(Text)
+    # Approvals are per-server (item 35): an approval granted for a tool on one
+    # server must not redeem an identically-named tool on another.
+    server_id: Mapped[str] = mapped_column(Text, server_default=text("'default'"))
     tool_name: Mapped[str] = mapped_column(Text)
     arguments_hash: Mapped[str] = mapped_column(CHAR(64))
     created_at: Mapped[datetime] = mapped_column(

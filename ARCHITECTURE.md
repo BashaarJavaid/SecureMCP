@@ -160,7 +160,7 @@ Edges elided for readability: Auth bumps the gateway-wide auth-failure counter i
 
 ### 4.5 Deployment diagrams
 
-**(a) MVP — Docker Compose (what this repo runs today).** Five services on one host; the upstream MCP server is *not* a compose service — it's a stdio subprocess spawned per session inside the gateway container (`UPSTREAM_COMMAND`). The `rogue` service exists only to host the demo's mutation endpoint; the rogue MCP server itself also runs as stdio subprocesses inside the gateway.
+**(a) MVP — Docker Compose (what this repo runs today).** Five services on one host; the upstream MCP server is *not* a compose service — it's a stdio subprocess spawned per session inside the gateway container (registered in the policy's `servers:` block, item 35). The `rogue` service exists only to host the demo's mutation endpoint; the rogue MCP server itself also runs as stdio subprocesses inside the gateway.
 
 ```mermaid
 graph TD
@@ -240,7 +240,7 @@ graph TD
 
 ### 4.7 Multi-Server Trust Domains (discussion, not implemented)
 
-**Why v1 treats every registered server as equally trusted.** The gateway's trust boundary today runs *between* the client and the upstream — never *between* upstreams. Any server named in the policy file is, once connected, as trusted as any other: same pipeline, same risk factors, same drift thresholds. That's the right call for v1's deployment shape — a single operator registers every upstream by hand (`UPSTREAM_COMMAND`), so registration *is* the trust decision, made by a human, out of band. It matches `THREAT_MODEL.md`'s posture of drawing scope boundaries explicitly: the threat model already trusts Redis and Postgres inside the deployment's network boundary for the same reason. What v1 *does* defend against per-server is behavioral: the Drift Detector catches a registered server that changes shape after approval (the rug-pull), regardless of who owns it.
+**Why v1 treats every registered server as equally trusted.** The gateway's trust boundary today runs *between* the client and the upstream — never *between* upstreams. Any server named in the policy file is, once connected, as trusted as any other: same pipeline, same risk factors, same drift thresholds. That's the right call for v1's deployment shape — a single operator registers every upstream by hand (the policy's `servers:` block), so registration *is* the trust decision, made by a human, out of band. It matches `THREAT_MODEL.md`'s posture of drawing scope boundaries explicitly: the threat model already trusts Redis and Postgres inside the deployment's network boundary for the same reason. What v1 *does* defend against per-server is behavioral: the Drift Detector catches a registered server that changes shape after approval (the rug-pull), regardless of who owns it.
 
 **Where that assumption breaks.** The moment servers have different owners, "registered = trusted" stops describing reality:
 

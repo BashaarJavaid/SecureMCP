@@ -43,7 +43,6 @@ from mcp.types import (
 from services.gateway import abac, auth, metrics, param_validator, schema_pruner
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
-from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
@@ -112,6 +111,7 @@ def _error(request_id: RequestId, code: int, message: str, data: object = None) 
 @dataclass
 class Interceptor:
     identity_id: str
+    server_id: str
     session_id: str
     store: PolicyStore
     writer: AuditWriter
@@ -150,7 +150,7 @@ class Interceptor:
         self._pending[root.id] = root.method
         if root.method == "initialize":
             # A fresh handshake is the trust boundary to re-verify against (§8).
-            await self.cache.invalidate(settings.upstream_server_id)
+            await self.cache.invalidate(self.server_id)
         elif root.method == "tools/call":
             # §7: decision-pipeline time only — the upstream round trip is not in here.
             start = time.perf_counter()
@@ -201,7 +201,7 @@ class Interceptor:
                     arguments=arguments,
                 )
 
-        grant = self.engine.matching_grant(self.identity_id, settings.upstream_server_id, tool_name)
+        grant = self.engine.matching_grant(self.identity_id, self.server_id, tool_name)
         if grant is None:
             return await self._deny_rbac(request, tool_name, arguments)
 
@@ -223,7 +223,7 @@ class Interceptor:
         # Schema drift status (§4.2 stage 5): a tool blocked on High/Critical drift is
         # denied until re-approval; a status lookup failure also denies (§5).
         try:
-            drift_blocked = await self.detector.is_blocked(settings.upstream_server_id, tool_name)
+            drift_blocked = await self.detector.is_blocked(self.server_id, tool_name)
         except Exception:
             self._log.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
             drift_blocked = True
@@ -247,7 +247,11 @@ class Interceptor:
         if approval_id is not None:
             try:
                 denial = await self.approvals.redeem(
-                    str(approval_id), self.identity_id, tool_name, arguments_hash(arguments)
+                    str(approval_id),
+                    self.identity_id,
+                    self.server_id,
+                    tool_name,
+                    arguments_hash(arguments),
                 )
             except Exception:
                 self._log.exception("approval_redeem_failed_fail_closed", tool=tool_name)
@@ -265,7 +269,7 @@ class Interceptor:
         else:
             try:
                 risk_score, risk_factors = await self.risk.score(
-                    self.identity_id, tool_name, arguments, self.engine.policy.risk
+                    self.identity_id, self.server_id, tool_name, arguments, self.engine.policy.risk
                 )
             except Exception:
                 # A crashed risk calculation is maximum risk, not low risk (§5).
@@ -331,6 +335,7 @@ class Interceptor:
             seq = await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
                 risk_score=risk_score,
@@ -347,7 +352,7 @@ class Interceptor:
             audit_id=str(seq),
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, EventType.ALLOW.value
+            self.identity_id, self.server_id, tool_name, EventType.ALLOW.value
         ).inc()
         _strip_gateway_meta(params)
         return Forward(message)
@@ -361,7 +366,7 @@ class Interceptor:
         attrs: dict[str, abac.AttrValue] = {
             "identity.id": self.identity_id,
             "tool.name": tool_name,
-            "tool.server_id": settings.upstream_server_id,
+            "tool.server_id": self.server_id,
         }
         identity = self.engine.identity(self.identity_id)
         if identity is not None:
@@ -403,6 +408,7 @@ class Interceptor:
                     await self.writer.write(
                         EventType.POLICY_ERROR,
                         self.identity_id,
+                        server_id=self.server_id,
                         tool_name=tool_name,
                         payload_extra={"condition": condition.source, "reason": problem},
                     )
@@ -428,7 +434,7 @@ class Interceptor:
         return None
 
     async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:
-        tools = await self.cache.get(settings.upstream_server_id)
+        tools = await self.cache.get(self.server_id)
         if tools is None:
             tools = await self._refetch_tools()
             if tools is None:
@@ -451,8 +457,8 @@ class Interceptor:
             )
             result = await asyncio.wait_for(future, timeout=_REFETCH_TIMEOUT_S)
             tools: list[dict[str, Any]] = result.get("tools", [])
-            await self.detector.check(settings.upstream_server_id, tools, self.identity_id)
-            await self.cache.put(settings.upstream_server_id, tools)
+            await self.detector.check(self.server_id, tools, self.identity_id)
+            await self.cache.put(self.server_id, tools)
         except Exception:
             self._log.exception("tools_list_refetch_failed")
             return None
@@ -503,6 +509,7 @@ class Interceptor:
             seq = await self.writer.write(
                 event_type,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
                 risk_score=risk_score,
@@ -520,7 +527,7 @@ class Interceptor:
             audit_id=decision.audit_id,
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+            self.identity_id, self.server_id, tool_name, event_type.value
         ).inc()
         if event_type is EventType.DENY_REPLAY:
             metrics.REPLAY_DENIED.inc()
@@ -582,6 +589,7 @@ class Interceptor:
             seq = await self.writer.write(
                 event_type,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra={
                     "reason": reason,
@@ -595,7 +603,7 @@ class Interceptor:
             if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
                 # The approvals row references this audit seq (§4.8) — audit-first.
                 decision.approval_id = await self.approvals.create(
-                    self.identity_id, tool_name, arguments_hash(arguments), seq
+                    self.identity_id, self.server_id, tool_name, arguments_hash(arguments), seq
                 )
         except Exception:
             # No record (or no approval row) means the call cannot proceed anyway,
@@ -614,7 +622,7 @@ class Interceptor:
             approval_id=decision.approval_id,
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+            self.identity_id, self.server_id, tool_name, event_type.value
         ).inc()
         return _error(
             request.id,
@@ -674,16 +682,14 @@ class Interceptor:
     ) -> SessionMessage:
         full = response.result.get("tools", [])
         try:
-            await self.detector.check(settings.upstream_server_id, full, self.identity_id)
+            await self.detector.check(self.server_id, full, self.identity_id)
         except Exception:
             self._log.exception("drift_check_failed_fail_closed")
             return _error(
                 response.id, AUDIT_UNAVAILABLE_CODE, "drift check unavailable; tools/list denied"
             ).message
-        schema_hash = await self.cache.put(settings.upstream_server_id, full)
-        served = schema_pruner.prune(
-            full, self.identity_id, settings.upstream_server_id, self.engine
-        )
+        schema_hash = await self.cache.put(self.server_id, full)
+        served = schema_pruner.prune(full, self.identity_id, self.server_id, self.engine)
         response.result["tools"] = served
         # §8 ETag, realized as result metadata (per-message conditional HTTP semantics
         # don't exist over the streamed transport).
@@ -694,6 +700,7 @@ class Interceptor:
             await self.writer.write(
                 EventType.TOOLS_LIST,
                 self.identity_id,
+                server_id=self.server_id,
                 payload_extra={"served_tools": served_names, "pruned_tools": pruned_names},
             )
         except Exception:

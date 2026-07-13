@@ -85,10 +85,13 @@ async def clean_audit() -> None:
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     try:
         await redis_client.ping()
-        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
-        risk_keys = await redis_client.keys("risk:*")
-        if risk_keys:
-            await redis_client.delete(*risk_keys)
+        await redis_client.delete(POINTER_KEY)
+        # Any server's cached schema (item 35: the multi-server test registers
+        # non-default ids), plus the risk counters.
+        for pattern in ("schema:*", "risk:*"):
+            keys = await redis_client.keys(pattern)
+            if keys:
+                await redis_client.delete(*keys)
     except Exception:
         pytest.skip("redis not reachable — run: docker compose up -d redis")
     finally:
@@ -123,6 +126,7 @@ def policy_dict(
 ) -> dict:
     return {
         "version": version,
+        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -164,14 +168,18 @@ def write_signing_keypair(directory: Path) -> tuple[Path, Path]:
 async def running_gateway(
     policy_path: Path, upstream_command: str, keys: dict[str, str]
 ) -> AsyncIterator[Gateway]:
-    """The gateway app on an ephemeral port with the given policy file and upstream."""
+    """The gateway app on an ephemeral port with the given policy file and upstream.
+    A policy without a `servers:` block (the single-server fixtures) gets the given
+    command registered as "default" — item 35's registry, transparently."""
+    policy = yaml.safe_load(policy_path.read_text())
+    if "servers" not in policy:
+        policy["servers"] = {"default": upstream_command}
+        policy_path.write_text(yaml.safe_dump(policy))
     old_policy_file = settings.policy_file
-    old_command = settings.upstream_command
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file
     old_revisions_dir = settings.policy_revisions_dir
     settings.policy_file = str(policy_path)
-    settings.upstream_command = upstream_command
     settings.policy_revisions_dir = str(policy_path.parent / "revisions")
     private_path, public_path = write_signing_keypair(policy_path.parent)
     settings.signing_key_file = str(private_path)
@@ -189,7 +197,6 @@ async def running_gateway(
         yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
     finally:
         settings.policy_file = old_policy_file
-        settings.upstream_command = old_command
         settings.signing_key_file = old_signing_key
         settings.signing_public_key_file = old_signing_pub
         settings.policy_revisions_dir = old_revisions_dir

@@ -40,7 +40,9 @@ class ApprovalStore:
         self._sessions = sessionmaker
         self._writer = writer
 
-    async def create(self, identity_id: str, tool_name: str, args_hash: str, audit_id: int) -> str:
+    async def create(
+        self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
+    ) -> str:
         approval_id = uuid.uuid4().hex
         async with self._sessions() as session:
             session.add(
@@ -48,6 +50,7 @@ class ApprovalStore:
                     approval_id=approval_id,
                     audit_id=audit_id,
                     identity_id=identity_id,
+                    server_id=server_id,
                     tool_name=tool_name,
                     arguments_hash=args_hash,
                     expires_at=datetime.now(UTC) + timedelta(seconds=settings.approval_ttl_seconds),
@@ -56,11 +59,11 @@ class ApprovalStore:
             await session.commit()
         return approval_id
 
-    async def approve(self, approval_id: str, approved_by: str) -> tuple[int, str, str]:
+    async def approve(self, approval_id: str, approved_by: str) -> tuple[int, str, str, str]:
         """Admin action: pending + unexpired -> approved. Returns the APPROVED audit
-        row's seq plus the approval's (identity_id, tool_name) — the risk-decay
-        counter is keyed on that pair. Raises LookupError for anything that can't
-        be approved."""
+        row's seq plus the approval's (identity_id, server_id, tool_name) — the
+        risk-decay counter is keyed on that triple. Raises LookupError for anything
+        that can't be approved."""
         async with self._sessions() as session:
             row = await self._locked(session, approval_id)
             if row is None:
@@ -70,6 +73,7 @@ class ApprovalStore:
                 await self._writer.write(
                     EventType.EXPIRED,
                     row.identity_id,
+                    server_id=row.server_id,
                     tool_name=row.tool_name,
                     payload_extra={"approval_id": approval_id},
                 )
@@ -83,14 +87,15 @@ class ApprovalStore:
             seq = await self._writer.write(
                 EventType.APPROVED,
                 approved_by,
+                server_id=row.server_id,
                 tool_name=row.tool_name,
                 payload_extra={"approval_id": approval_id, "identity_id": row.identity_id},
             )
             await session.commit()
-            return seq, row.identity_id, row.tool_name
+            return seq, row.identity_id, row.server_id, row.tool_name
 
     async def redeem(
-        self, approval_id: str, identity_id: str, tool_name: str, args_hash: str
+        self, approval_id: str, identity_id: str, server_id: str, tool_name: str, args_hash: str
     ) -> tuple[EventType, str] | None:
         """Validate an approved retry and mark it consumed in the same transaction
         (one-time use holds even if the forward later fails). Returns None on success,
@@ -109,10 +114,14 @@ class ApprovalStore:
                 return (EventType.EXPIRED, "approval has expired")
             if row.status != "approved":
                 return (EventType.DENY_APPROVAL_MISMATCH, "approval has not been granted")
-            if row.identity_id != identity_id or row.tool_name != tool_name:
+            if (
+                row.identity_id != identity_id
+                or row.server_id != server_id
+                or row.tool_name != tool_name
+            ):
                 return (
                     EventType.DENY_APPROVAL_MISMATCH,
-                    "approval was granted to a different identity or tool",
+                    "approval was granted to a different identity, server, or tool",
                 )
             if row.arguments_hash != args_hash:
                 # TOCTOU (§4.8): arguments changed between approval and dispatch.
@@ -138,6 +147,7 @@ class ApprovalStore:
                 await self._writer.write(
                     EventType.EXPIRED,
                     row.identity_id,
+                    server_id=row.server_id,
                     tool_name=row.tool_name,
                     payload_extra={"approval_id": row.approval_id},
                 )

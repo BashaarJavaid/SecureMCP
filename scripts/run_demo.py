@@ -19,8 +19,8 @@ and when prompted, in another terminal (the exact command, with this run's secre
 is printed by the script):
     POLICY_FILE=policies/demo-policy.yaml \
       SECURMCP_DEMO_SIGNING_SECRET=<printed by the script> \
-      UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" \
       docker compose up -d --build
+(the rogue upstream command lives in the demo policy's `servers:` block, item 35)
 then, when prompted again (the rug pull, visible on screen):
     curl -X POST localhost:9800/_admin/apply_mutation
 and for the closing simulation beat (activates the v2 draft so it gets a snapshot):
@@ -134,6 +134,12 @@ def write_policy(
         yaml.safe_dump(
             {
                 "version": version,
+                # Server registry (item 35): the rogue upstream, spawned per session
+                # inside the gateway container (container path for --state).
+                "servers": {
+                    "default": "python sample_target/rogue_server.py"
+                    " --state /rogue-state/state.json"
+                },
                 "identities": [
                     {
                         "id": "developer",
@@ -190,7 +196,7 @@ async def reset_dev_state() -> None:
     itself register as drift."""
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     try:
-        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
+        await redis_client.delete(POINTER_KEY, "schema:default")
     except Exception:
         sys.exit("redis not reachable — run: docker compose up -d redis")
     finally:
@@ -215,7 +221,7 @@ async def connect(api_key: str) -> AsyncIterator[ClientSession]:
     async with httpx.AsyncClient(
         headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
     ) as http_client:
-        async with streamable_http_client(f"{GATEWAY}/mcp", http_client=http_client) as (
+        async with streamable_http_client(f"{GATEWAY}/mcp/default", http_client=http_client) as (
             read,
             write,
             _,
@@ -230,11 +236,8 @@ async def wait_for_gateway(api_key: str, signing_secret: str) -> None:
     print("  In another terminal:")
     print("    POLICY_FILE=policies/demo-policy.yaml \\")
     print(f"      {SIGNED_SECRET_ENV_NAME}={signing_secret} \\")
-    print(
-        '      UPSTREAM_COMMAND="python sample_target/rogue_server.py'
-        ' --state /rogue-state/state.json" \\'
-    )
     print("      docker compose up -d --build")
+    print("  (the rogue upstream command is in the demo policy's servers: block)")
     print(
         "  (stack already running with the demo policy? hot-reload this run's fresh"
         " keys with:  docker kill -s HUP securemcp-gateway-1)"
@@ -243,7 +246,7 @@ async def wait_for_gateway(api_key: str, signing_secret: str) -> None:
         for _ in range(240):
             try:
                 response = await client.post(
-                    f"{GATEWAY}/mcp/", json={}, headers={"X-SecurMCP-Key": api_key}
+                    f"{GATEWAY}/mcp/default", json={}, headers={"X-SecurMCP-Key": api_key}
                 )
                 if response.status_code != 401:  # demo key accepted => demo policy live
                     print("  gateway is up.")
@@ -328,7 +331,7 @@ async def replay_blocked(ci_key_id: str, ci_secret: bytes) -> None:
                 "_meta": signed_meta(ci_key_id, ci_secret, "initialize"),
             },
         }
-        response = await client.post(f"{GATEWAY}/mcp/", headers=SIGNED_HEADERS, json=init)
+        response = await client.post(f"{GATEWAY}/mcp/default", headers=SIGNED_HEADERS, json=init)
         response.raise_for_status()
         headers = {**SIGNED_HEADERS, "mcp-session-id": response.headers["mcp-session-id"]}
         initialized = {
@@ -336,7 +339,9 @@ async def replay_blocked(ci_key_id: str, ci_secret: bytes) -> None:
             "method": "notifications/initialized",
             "params": {"_meta": signed_meta(ci_key_id, ci_secret, "notifications/initialized")},
         }
-        (await client.post(f"{GATEWAY}/mcp/", headers=headers, json=initialized)).raise_for_status()
+        (
+            await client.post(f"{GATEWAY}/mcp/default", headers=headers, json=initialized)
+        ).raise_for_status()
 
         arguments: dict = {}
         call = {
@@ -351,12 +356,14 @@ async def replay_blocked(ci_key_id: str, ci_secret: bytes) -> None:
         }
         body = json.dumps(call).encode()  # the attacker's capture: headers + body
 
-        first = sse_json(await client.post(f"{GATEWAY}/mcp/", headers=headers, content=body))
+        first = sse_json(await client.post(f"{GATEWAY}/mcp/default", headers=headers, content=body))
         if "result" not in first:
             sys.exit(f"expected the signed call to be allowed, got: {first}")
         print("  first send (signed, no API key on the wire): allowed")
 
-        replayed = sse_json(await client.post(f"{GATEWAY}/mcp/", headers=headers, content=body))
+        replayed = sse_json(
+            await client.post(f"{GATEWAY}/mcp/default", headers=headers, content=body)
+        )
         decision = replayed.get("error", {}).get("data", {})
         if decision.get("event_type") != "DENY_REPLAY":
             sys.exit("expected DENY_REPLAY — identical nonce should never execute twice")
@@ -367,7 +374,7 @@ async def replay_blocked(ci_key_id: str, ci_secret: bytes) -> None:
         forged = json.loads(body)
         forged["params"]["_meta"][NONCE_META_KEY] = str(uuid.uuid4())
         forged["params"]["_meta"][TIMESTAMP_META_KEY] = int(time.time())
-        response = await client.post(f"{GATEWAY}/mcp/", headers=headers, json=forged)
+        response = await client.post(f"{GATEWAY}/mcp/default", headers=headers, json=forged)
         if response.status_code != 401:
             sys.exit(f"expected 401 for a forged nonce, got {response.status_code}")
         print("  fresh nonce, captured signature: HTTP 401 — nothing in the capture")

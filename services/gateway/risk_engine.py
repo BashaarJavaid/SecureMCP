@@ -195,12 +195,12 @@ FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
 ]
 
 
-def _freq_key(identity_id: str, tool_name: str) -> str:
-    return f"risk:freq:{identity_id}:{tool_name}"
+def _freq_key(identity_id: str, server_id: str, tool_name: str) -> str:
+    return f"risk:freq:{identity_id}:{server_id}:{tool_name}"
 
 
-def _decay_key(identity_id: str, tool_name: str) -> str:
-    return f"risk:decay:{identity_id}:{tool_name}"
+def _decay_key(identity_id: str, server_id: str, tool_name: str) -> str:
+    return f"risk:decay:{identity_id}:{server_id}:{tool_name}"
 
 
 def _denial_key(identity_id: str) -> str:
@@ -244,6 +244,7 @@ class RiskEngine:
     async def score(
         self,
         identity_id: str,
+        server_id: str,
         tool_name: str,
         arguments: dict[str, Any],
         risk_policy: RiskPolicy,
@@ -254,9 +255,9 @@ class RiskEngine:
         what a live call would score — the frequency counter is read + 1 instead
         of INCRed, so explaining never mutates telemetry."""
         if dry_run:
-            call_count = await self._counter(_freq_key(identity_id, tool_name)) + 1
+            call_count = await self._counter(_freq_key(identity_id, server_id, tool_name)) + 1
         else:
-            call_count = await self._bump_frequency(identity_id, tool_name)
+            call_count = await self._bump_frequency(identity_id, server_id, tool_name)
         ctx = RiskContext(
             identity_id=identity_id,
             tool_name=tool_name,
@@ -264,24 +265,22 @@ class RiskEngine:
             policy=risk_policy,
             now=datetime.now(UTC),
             call_count=call_count,
-            drift_in_review=await self._detector.has_pending_drift(
-                settings.upstream_server_id, tool_name
-            ),
+            drift_in_review=await self._detector.has_pending_drift(server_id, tool_name),
             denial_count=await self._counter(_denial_key(identity_id)),
             auth_failure_count=await self._counter(auth.AUTH_FAILURE_KEY),
             drift_event_count=await self._detector.recent_drift_count(
-                settings.upstream_server_id,
+                server_id,
                 tool_name,
                 settings.risk_drift_history_window_seconds,
             ),
         )
         factors = [factor for fn in FACTORS if (factor := fn(ctx)) is not None]
-        decay_raw = await self._redis.get(_decay_key(identity_id, tool_name))
+        decay_raw = await self._redis.get(_decay_key(identity_id, server_id, tool_name))
         decay = min(int(decay_raw or 0), settings.risk_decay_max)
         return combine(factors, decay), factors
 
-    async def _bump_frequency(self, identity_id: str, tool_name: str) -> int:
-        key = _freq_key(identity_id, tool_name)
+    async def _bump_frequency(self, identity_id: str, server_id: str, tool_name: str) -> int:
+        key = _freq_key(identity_id, server_id, tool_name)
         count: int = await self._redis.incr(key)
         if count == 1:
             await self._redis.expire(key, settings.risk_freq_window_seconds)
@@ -299,10 +298,10 @@ class RiskEngine:
         if count == 1:
             await self._redis.expire(key, settings.risk_denial_window_seconds)
 
-    async def apply_decay(self, identity_id: str, tool_name: str) -> None:
+    async def apply_decay(self, identity_id: str, server_id: str, tool_name: str) -> None:
         """One admin approval = one calibration step (§4.8): grow this pair's offset.
         The TTL refreshes on every approval (item 33) so active calibration persists
         while idle calibration ages out; score() clamps the read to risk_decay_max."""
-        key = _decay_key(identity_id, tool_name)
+        key = _decay_key(identity_id, server_id, tool_name)
         await self._redis.incrby(key, settings.risk_decay_step)
         await self._redis.expire(key, settings.risk_decay_ttl_seconds)

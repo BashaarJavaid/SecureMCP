@@ -11,7 +11,9 @@ from tests.integration.conftest import SignedGateway, SignedSession
 
 async def test_signed_client_full_sequence(signed_gateway: SignedGateway) -> None:
     async with httpx.AsyncClient(follow_redirects=True) as http_client:  # no key header
-        async with streamable_http_client(f"{signed_gateway.url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(
+            f"{signed_gateway.url}/mcp/default", http_client=http_client
+        ) as (
             read,
             write,
             _,

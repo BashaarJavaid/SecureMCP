@@ -8,9 +8,13 @@ from pydantic import ValidationError
 from services.gateway import policy_engine
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 
+SERVERS = {"github": "unused-command", "filesystem": "unused-command"}
+
 
 def make_engine(identities: list[dict]) -> PolicyEngine:
-    return PolicyEngine(PolicyFile.model_validate({"version": 3, "identities": identities}))
+    return PolicyEngine(
+        PolicyFile.model_validate({"version": 3, "servers": SERVERS, "identities": identities})
+    )
 
 
 READONLY = {
@@ -108,6 +112,25 @@ identities:
     )
     with pytest.raises(ValidationError):
         policy_engine.load(policy)
+
+
+# --- server registry validation (item 35) ---
+
+
+def test_grant_naming_unregistered_server_fails_load() -> None:
+    with pytest.raises(ValidationError, match="unregistered server"):
+        PolicyFile.model_validate({"version": 1, "servers": {}, "identities": [READONLY]})
+
+
+def test_wildcard_is_not_a_registrable_server_id() -> None:
+    with pytest.raises(ValidationError, match="not a registrable"):
+        PolicyFile.model_validate({"version": 1, "servers": {"*": "cmd"}, "identities": []})
+
+
+def test_server_command_resolves_registered_servers() -> None:
+    engine = make_engine([READONLY])
+    assert engine.server_command("github") == "unused-command"
+    assert engine.server_command("nope") is None
 
 
 def test_matching_grant_none_when_rbac_denies() -> None:

@@ -74,16 +74,22 @@ class SessionManager:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    async def create(self, identity_id: str) -> Session:
-        if not settings.upstream_command:
-            raise RuntimeError("UPSTREAM_COMMAND is not configured")
+    async def create(self, identity_id: str, server_id: str) -> Session:
+        # Resolved against the live registry (item 35) — an id that vanished in a
+        # policy swap fails here, before anything is recorded or spawned.
+        command = self._policy_store.engine.server_command(server_id)
+        if command is None:
+            raise LookupError(f"unknown server {server_id!r}")
         session_id = uuid.uuid4().hex
         # No record, no session (§5): the SESSION_START row lands before anything spawns.
         await self._writer.write(
-            EventType.SESSION_START, identity_id, payload_extra={"session_id": session_id}
+            EventType.SESSION_START,
+            identity_id,
+            server_id=server_id,
+            payload_extra={"session_id": session_id},
         )
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
-        process = await upstream_client.spawn(settings.upstream_command)
+        process = await upstream_client.spawn(command)
 
         async def send_upstream(message: JSONRPCMessage) -> None:
             await upstream_client.write_message(process, message)
@@ -94,6 +100,7 @@ class SessionManager:
             process=process,
             interceptor=Interceptor(
                 identity_id=identity_id,
+                server_id=server_id,
                 session_id=session_id,
                 store=self._policy_store,
                 writer=self._writer,

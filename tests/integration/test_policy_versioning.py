@@ -28,6 +28,7 @@ from tests.integration.test_policy_scoping import connect
 def _policy(keys: dict[str, str], version: int = 1, agent_tools: list[str] | None = None) -> dict:
     return {
         "version": version,
+        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
         "identities": [
             {
                 "id": "agent",

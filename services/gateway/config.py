@@ -7,11 +7,6 @@ class Settings(BaseSettings):
     # Defaults are local-dev only; docker-compose.yml / .env override them.
     database_url: str = "postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp"
     redis_url: str = "redis://localhost:6379/0"
-    # Single upstream MCP server, spawned per session as a stdio subprocess (ROADMAP item 2:
-    # one hardcoded upstream, no server registry). Empty = session creation fails.
-    upstream_command: str = ""
-    # Policy name for the single upstream until a server registry exists.
-    upstream_server_id: str = "default"
     policy_file: str = "policies/example-policy.yaml"
     # Append-only revision snapshots written on every policy activation (§4.8, item 19).
     policy_revisions_dir: str = "policies/revisions"

@@ -187,13 +187,13 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=403, detail="admin identity required")
     approval_store: ApprovalStore = request.app.state.approval_store
     try:
-        seq, requester_id, tool_name = await approval_store.approve(
+        seq, requester_id, server_id, tool_name = await approval_store.approve(
             approval_id, approved_by=identity_id
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     risk_engine: RiskEngine = request.app.state.risk_engine
-    await risk_engine.apply_decay(requester_id, tool_name)
+    await risk_engine.apply_decay(requester_id, server_id, tool_name)
     decision = Decision(
         decision=DecisionOutcome.ALLOW,
         event_type=EventType.APPROVED,
@@ -297,6 +297,8 @@ async def get_decision(seq: int, request: Request) -> dict[str, object]:
 class ExplainRequest(BaseModel):
     identity: str
     tool: str
+    # Omitted + exactly one registered server -> that server; ambiguous -> 400.
+    server: str | None = None
     arguments: dict[str, Any] = {}
     context: dict[str, Any] = {}
 
@@ -307,12 +309,21 @@ async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, 
     §4.2 pipeline for a would-be call against the current in-memory policy — no
     audit rows, no approvals, no counter bumps, no upstream traffic."""
     await _require_admin(request)
+    engine = request.app.state.policy_store.engine
+    server_id = body.server
+    if server_id is None:
+        if len(engine.policy.servers) != 1:
+            raise HTTPException(
+                status_code=400, detail="multiple servers registered; specify `server`"
+            )
+        server_id = next(iter(engine.policy.servers))
     decision = await decision_explainer.explain_call(
         body.identity,
         body.tool,
+        server_id,
         body.arguments,
         body.context,
-        engine=request.app.state.policy_store.engine,
+        engine=engine,
         detector=request.app.state.drift_detector,
         risk=request.app.state.risk_engine,
         schema_cache=SchemaCache(request.app.state.redis),
@@ -384,11 +395,18 @@ async def _buffer_body(receive: Receive) -> tuple[bytes, Receive]:
 
 
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
-    """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport."""
+    """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport.
+
+    Path-based upstream routing (item 35): clients connect to /mcp/{server_id}; the
+    id must be registered in the policy's `servers:` block. One session = one
+    upstream, chosen here at connect time."""
     manager: SessionManager = scope["app"].state.session_manager
     headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
     session_id = headers.get(MCP_SESSION_ID_HEADER)
     engine = scope["app"].state.policy_store.engine
+
+    # The mount keeps the full path and puts its own prefix in root_path.
+    server_id = scope["path"].removeprefix(scope.get("root_path", "")).strip("/")
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
     # Bearer: the key header, hash-and-lookup. Signed (item 34): no header — the
@@ -427,6 +445,11 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         )
         return
 
+    # After auth, so an unauthenticated probe can't enumerate registered server ids.
+    if engine.server_command(server_id) is None:
+        await Response("unknown server", status_code=404)(scope, receive, send)
+        return
+
     if session_id is not None:
         session = manager.get(session_id)
         if session is None:
@@ -438,12 +461,16 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
                 scope, receive, send
             )
             return
+        if session.interceptor.server_id != server_id:
+            # A session is bound to the upstream it was created against (item 35).
+            await Response("session not found", status_code=404)(scope, receive, send)
+            return
     elif scope["method"] == "POST":
         # A POST without a session header is a new session (the initialize request).
         # Any failure here — including the SESSION_START audit write — means no
         # session (§5: no record, no action).
         try:
-            session = await manager.create(identity_id)
+            session = await manager.create(identity_id, server_id)
         except Exception:
             logger.exception("session_creation_failed", identity=identity_id)
             await Response("session could not be created", status_code=503)(scope, receive, send)
