@@ -45,6 +45,7 @@ _OUTCOMES: dict[EventType, DecisionOutcome] = {
     EventType.DENY_RISK: DecisionOutcome.DENY,
     EventType.DENY_VALIDATION: DecisionOutcome.DENY,
     EventType.DENY_APPROVAL_MISMATCH: DecisionOutcome.DENY,
+    EventType.DENY_STEP_UP: DecisionOutcome.DENY,
     EventType.EXPIRED: DecisionOutcome.DENY,
     EventType.CHALLENGE: DecisionOutcome.CHALLENGE,
     EventType.HUMAN_APPROVAL_REQUIRED: DecisionOutcome.HUMAN_APPROVAL_REQUIRED,

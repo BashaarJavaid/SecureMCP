@@ -17,6 +17,9 @@ class EventType(StrEnum):
     DENY_RISK = "DENY_RISK"
     DENY_VALIDATION = "DENY_VALIDATION"
     DENY_APPROVAL_MISMATCH = "DENY_APPROVAL_MISMATCH"
+    # Item 37: a step-up retry whose challenge/proof failed — unknown/expired/
+    # consumed challenge, mismatched call, or an invalid or reused TOTP code.
+    DENY_STEP_UP = "DENY_STEP_UP"
     CHALLENGE = "CHALLENGE"
     HUMAN_APPROVAL_REQUIRED = "HUMAN_APPROVAL_REQUIRED"
     APPROVED = "APPROVED"
@@ -59,6 +62,10 @@ class Decision(BaseModel):
     # Set only on HUMAN_APPROVAL_REQUIRED: the id the client passes back via
     # params._meta["securmcp/approval_id"] on the approved retry (§4.8).
     approval_id: str | None = None
+    # Set only on an answerable CHALLENGE (item 37 — the identity has a TOTP
+    # factor): the one-time id the client passes back via
+    # params._meta["securmcp/challenge_id"] alongside a fresh TOTP code.
+    challenge_id: str | None = None
     # Decision Explanation only (§4.8, item 20): the outcome the 40/70/90 threshold
     # mapping gives for risk_score, set when that differs from the actual outcome
     # (e.g. an ABAC risk-condition deny at score 74 → "human_approval_required").

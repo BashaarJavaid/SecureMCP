@@ -29,6 +29,7 @@ from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
+from services.gateway.step_up import ChallengeStore
 
 logger = structlog.get_logger(__name__)
 
@@ -60,6 +61,7 @@ class SessionManager:
         replay_guard: ReplayGuard,
         risk_engine: RiskEngine,
         approval_store: ApprovalStore,
+        challenge_store: ChallengeStore,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
@@ -69,6 +71,7 @@ class SessionManager:
         self._replay_guard = replay_guard
         self._risk_engine = risk_engine
         self._approval_store = approval_store
+        self._challenge_store = challenge_store
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -109,6 +112,7 @@ class SessionManager:
                 replay=self._replay_guard,
                 risk=self._risk_engine,
                 approvals=self._approval_store,
+                challenges=self._challenge_store,
                 send_upstream=send_upstream,
             ),
         )

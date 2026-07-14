@@ -87,8 +87,8 @@ async def clean_audit() -> None:
         await redis_client.ping()
         await redis_client.delete(POINTER_KEY)
         # Any server's cached schema (item 35: the multi-server test registers
-        # non-default ids), plus the risk counters.
-        for pattern in ("schema:*", "risk:*"):
+        # non-default ids), plus the risk counters and step-up challenge state.
+        for pattern in ("schema:*", "risk:*", "challenge:*"):
             keys = await redis_client.keys(pattern)
             if keys:
                 await redis_client.delete(*keys)

@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     drift_description_severity: Literal["low", "medium", "high", "critical"] = "high"
     # Human approval lifecycle (§4.8): pending approvals expire after this TTL.
     approval_ttl_seconds: int = 900
+    # Step-up auth (item 37): pending challenges live in Redis for this long; the
+    # human just needs time to read a code off their authenticator app. TOTP
+    # step/digits/skew are RFC 6238 spec constants in step_up.py, not knobs.
+    step_up_ttl_seconds: int = 300
     # Prometheus scrape port (§7, item 25) — a separate internal-only listener,
     # never the published app port (labels carry identity ids and tool names).
     # The verifier sidecar sets its own via METRICS_PORT in compose.

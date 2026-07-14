@@ -36,6 +36,7 @@ from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
+from services.gateway.step_up import ChallengeStore
 
 logging_config.configure()
 logger = structlog.get_logger(__name__)
@@ -113,6 +114,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ReplayGuard(redis_client, settings.replay_window_seconds),
         risk_engine,
         approval_store,
+        ChallengeStore(redis_client),
     )
     app.state.session_manager = manager
     # §7 metrics on a separate internal-only listener — never the published app

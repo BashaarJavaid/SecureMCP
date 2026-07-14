@@ -40,7 +40,7 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import abac, auth, metrics, param_validator, schema_pruner
+from services.gateway import abac, auth, metrics, param_validator, schema_pruner, step_up
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
 from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
@@ -63,6 +63,8 @@ _GATEWAY_META_KEYS = (
     NONCE_META_KEY,
     TIMESTAMP_META_KEY,
     APPROVAL_META_KEY,
+    step_up.CHALLENGE_ID_META_KEY,
+    step_up.CHALLENGE_PROOF_META_KEY,
     auth.KEY_ID_META_KEY,
     auth.SIGNATURE_META_KEY,
 )
@@ -120,6 +122,7 @@ class Interceptor:
     replay: ReplayGuard
     risk: RiskEngine
     approvals: ApprovalStore
+    challenges: step_up.ChallengeStore
     send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
@@ -238,6 +241,38 @@ class Interceptor:
                 arguments=arguments,
             )
 
+        # Step-up redemption (item 37): a retry carrying a challenge id + TOTP proof
+        # consumes the challenge and verifies the code — any failure is a terminal
+        # DENY_STEP_UP (§5). Success only sets a flag: unlike an approval, the call
+        # is still re-scored below, and a verified proof clears nothing but the
+        # CHALLENGE band.
+        challenge_id = meta.get(step_up.CHALLENGE_ID_META_KEY)
+        step_up_verified = False
+        if challenge_id is not None:
+            try:
+                failure = await self.challenges.redeem(
+                    str(challenge_id),
+                    self.identity_id,
+                    self.server_id,
+                    tool_name,
+                    arguments_hash(arguments),
+                    meta.get(step_up.CHALLENGE_PROOF_META_KEY),
+                    identity.totp_secret if identity is not None else "",
+                )
+            except Exception:
+                self._log.exception("challenge_redeem_failed_fail_closed", tool=tool_name)
+                failure = "challenge store unavailable"
+            if failure is not None:
+                return await self._deny(
+                    request,
+                    tool_name,
+                    EventType.DENY_STEP_UP,
+                    f"step-up verification failed: {failure}",
+                    ["step_up"],
+                    arguments=arguments,
+                )
+            step_up_verified = True
+
         # Risk Engine (§4.2 stage 6, before param validation). A retry carrying an
         # approval id redeems it instead of re-scoring: a human reviewed this exact
         # call (§4.8); RBAC/drift/replay above and param validation below still apply.
@@ -304,7 +339,9 @@ class Interceptor:
             if denied is not None:
                 return denied
             risk_outcome = threshold_outcome(risk_score)
-            if risk_outcome is not DecisionOutcome.ALLOW:
+            if risk_outcome is DecisionOutcome.CHALLENGE and step_up_verified:
+                pass  # the verified proof satisfies the challenge — continue (item 37)
+            elif risk_outcome is not DecisionOutcome.ALLOW:
                 return await self._risk_terminal(
                     request, tool_name, arguments, risk_outcome, risk_score, risk_factors
                 )
@@ -331,6 +368,8 @@ class Interceptor:
             payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         if approval_id is not None:
             payload_extra["approval_id"] = str(approval_id)
+        if step_up_verified:
+            payload_extra["challenge_id"] = str(challenge_id)
         try:
             seq = await self.writer.write(
                 EventType.ALLOW,
@@ -565,6 +604,8 @@ class Interceptor:
                 arguments=arguments,
             )
         self._pending.pop(request.id, None)
+        identity = self.engine.identity(self.identity_id)
+        step_up_capable = identity is not None and bool(identity.totp_secret)
         if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
             event_type = EventType.HUMAN_APPROVAL_REQUIRED
             reason = (
@@ -572,10 +613,13 @@ class Interceptor:
                 " retry with the approval id once granted"
             )
         else:
-            # v1 challenge is terminal: a distinct error the client surfaces to a
-            # human for confirmation; a real step-up auth flow is Phase 4 (§4.8).
+            # Step-up auth (item 37): an identity with a TOTP factor gets a
+            # redeemable challenge; without one the CHALLENGE stays a terminal
+            # error the client can only surface to a human.
             event_type = EventType.CHALLENGE
             reason = f"risk score {risk_score} for {tool_name!r} requires confirmation"
+            if step_up_capable:
+                reason += "; retry with the challenge id and a fresh TOTP code"
         decision = Decision(
             decision=outcome,
             event_type=event_type,
@@ -605,6 +649,12 @@ class Interceptor:
                 decision.approval_id = await self.approvals.create(
                     self.identity_id, self.server_id, tool_name, arguments_hash(arguments), seq
                 )
+            elif step_up_capable:
+                # Same audit-first shape (item 37): no challenge record, no
+                # redeemable challenge.
+                decision.challenge_id = await self.challenges.create(
+                    self.identity_id, self.server_id, tool_name, arguments_hash(arguments), seq
+                )
         except Exception:
             # No record (or no approval row) means the call cannot proceed anyway,
             # and unlike a plain deny an approval decision is useless without its
@@ -620,6 +670,7 @@ class Interceptor:
             risk_score=risk_score,
             audit_id=decision.audit_id,
             approval_id=decision.approval_id,
+            challenge_id=decision.challenge_id,
         )
         metrics.TOOL_CALLS.labels(
             self.identity_id, self.server_id, tool_name, event_type.value

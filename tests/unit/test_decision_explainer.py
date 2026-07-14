@@ -89,6 +89,21 @@ def test_allow_row() -> None:
     assert decision.alternative is None
 
 
+def test_deny_step_up_row_is_a_decision() -> None:
+    decision = from_audit_row(
+        row(
+            event_type=EventType.DENY_STEP_UP.value,
+            payload={
+                "reason": "step-up verification failed: TOTP proof is invalid",
+                "matched_rules": ["step_up"],
+            },
+        )
+    )
+    assert decision.decision is DecisionOutcome.DENY
+    assert decision.event_type is EventType.DENY_STEP_UP
+    assert decision.matched_rules == ["step_up"]
+
+
 def test_legacy_rbac_deny_reconstructs_rules_and_reason() -> None:
     decision = from_audit_row(row(event_type=EventType.DENY_RBAC.value, payload={}))
     assert decision.matched_rules == ["policy-v7:rbac"]

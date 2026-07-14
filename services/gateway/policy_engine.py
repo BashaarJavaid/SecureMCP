@@ -19,7 +19,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
-from services.gateway import abac
+from services.gateway import abac, step_up
 
 logger = structlog.get_logger(__name__)
 
@@ -73,12 +73,17 @@ class Identity(BaseModel):
     # Name of the env var holding the base64/raw shared secret — indirection keeps
     # the YAML committable and revision snapshots secret-free.
     signing_secret_env: str | None = None
+    # Step-up factor (item 37, either auth mode): name of the env var holding the
+    # base32 TOTP secret — the same indirection as signing_secret_env. Unset means
+    # the identity's CHALLENGE band stays a terminal error.
+    totp_secret_env: str | None = None
     # Grants access to /admin endpoints (drift re-approval, and Phase 3's admin API).
     admin: bool = False
     allowed_servers: list[ServerGrant] = []
     # identity.* attributes for ABAC conditions (identity.id comes from `id` itself).
     attributes: dict[str, str | int | float | bool] = {}
     _signing_secret: bytes = PrivateAttr(default=b"")
+    _totp_secret: str = PrivateAttr(default="")
 
     @model_validator(mode="after")
     def _check_auth_fields(self) -> "Identity":
@@ -108,11 +113,31 @@ class Identity(BaseModel):
                     " — signed identities fail closed without their secret"
                 )
             self._signing_secret = secret.encode()
+        if self.totp_secret_env:
+            totp_secret = os.environ.get(self.totp_secret_env)
+            if not totp_secret:
+                raise ValueError(
+                    f"identity {self.id!r}: env var {self.totp_secret_env!r} is unset"
+                    " — a step-up factor fails closed without its secret"
+                )
+            try:
+                step_up.decode_totp_secret(totp_secret)
+            except Exception as exc:
+                # A malformed secret fails load, not every redemption (§5).
+                raise ValueError(
+                    f"identity {self.id!r}: {self.totp_secret_env!r} is not a valid"
+                    " base32 TOTP secret"
+                ) from exc
+            self._totp_secret = totp_secret
         return self
 
     @property
     def signing_secret(self) -> bytes:
         return self._signing_secret
+
+    @property
+    def totp_secret(self) -> str:
+        return self._totp_secret
 
 
 class PolicyFile(BaseModel):

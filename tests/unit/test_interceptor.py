@@ -147,6 +147,30 @@ class FakeApprovals:
         return "approval-1"
 
 
+class FakeChallenges:
+    def __init__(self) -> None:
+        self.redeemed: list[str] = []
+        self.failure: str | None = None
+
+    async def redeem(
+        self,
+        challenge_id: str,
+        identity_id: str,
+        server_id: str,
+        tool_name: str,
+        args_hash: str,
+        proof: object,
+        secret_b32: str,
+    ) -> str | None:
+        self.redeemed.append(challenge_id)
+        return self.failure
+
+    async def create(
+        self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
+    ) -> str:
+        return "challenge-1"
+
+
 async def _no_upstream(message: JSONRPCMessage) -> None:
     raise AssertionError("unexpected gateway-initiated upstream send")
 
@@ -173,6 +197,7 @@ def make_interceptor(
         replay=cast(Any, FakeReplay()),
         risk=cast(Any, risk or FakeRisk()),
         approvals=cast(Any, FakeApprovals()),
+        challenges=cast(Any, FakeChallenges()),
         send_upstream=_no_upstream,
     )
     return interceptor, writer, cache, detector
