@@ -10,7 +10,7 @@ from mcp import ClientSession, McpError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
-from tests.integration.conftest import Gateway, ReplayCompliantSession
+from tests.integration.conftest import Gateway
 
 
 @asynccontextmanager
@@ -19,12 +19,12 @@ async def connect(url: str, api_key: str) -> AsyncIterator[ClientSession]:
     async with httpx.AsyncClient(
         headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
     ) as http_client:
-        async with streamable_http_client(f"{url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(f"{url}/mcp/default", http_client=http_client) as (
             read,
             write,
             _,
         ):
-            async with ReplayCompliantSession(read, write) as session:
+            async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
 
@@ -71,7 +71,9 @@ async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway)
     async with httpx.AsyncClient(
         headers={"X-SecurMCP-Key": gateway.keys["agent-readonly"]}, follow_redirects=True
     ) as http_client:
-        async with streamable_http_client(f"{gateway.url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(
+            f"{gateway.url}/mcp/default", http_client=http_client
+        ) as (
             read,
             write,
             get_session_id,
@@ -84,7 +86,7 @@ async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway)
                 # agent-full's key is valid, but it isn't this session's identity.
                 async with httpx.AsyncClient() as other:
                     response = await other.get(
-                        f"{gateway.url}/mcp/",
+                        f"{gateway.url}/mcp/default",
                         headers={
                             "X-SecurMCP-Key": gateway.keys["agent-full"],
                             "mcp-session-id": session_id,

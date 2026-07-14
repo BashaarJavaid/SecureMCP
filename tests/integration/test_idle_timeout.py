@@ -26,7 +26,7 @@ async def test_idle_session_is_torn_down(gateway: Gateway) -> None:
                 headers={"X-SecurMCP-Key": gateway.keys["agent-full"]}, follow_redirects=True
             ) as http_client:
                 async with streamable_http_client(
-                    f"{gateway.url}/mcp", http_client=http_client
+                    f"{gateway.url}/mcp/default", http_client=http_client
                 ) as (read, write, _):
                     async with ClientSession(read, write) as session:
                         await session.initialize()

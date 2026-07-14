@@ -43,15 +43,12 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import ListToolsResult
-from sqlalchemy import text
 
-from services.gateway.audit_log import POINTER_KEY
+from scripts.reset_dev_state import ResetError, reset_dev_state
 from services.gateway.config import settings
-from services.gateway.db import Base, engine
 from services.gateway.schema_cache import SchemaCache
 from tests.integration.conftest import (
     Gateway,
-    ReplayCompliantSession,
     _key_hash,
     running_gateway,
 )
@@ -85,26 +82,13 @@ def bench_policy(keys: dict[str, str]) -> dict:
 
 
 async def preflight_clean() -> None:
-    """Same reset as the integration suite's clean_audit fixture, but exit with a
-    remedy instead of pytest.skip."""
-    remedy = "run: docker compose up -d postgres redis"
-    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    """Same reset as the integration suite's clean_audit fixture (the shared
+    item-38 function), but exit with a remedy instead of pytest.skip. Snapshots
+    stay untouched — running_gateway patches the revisions dir to a tmp path."""
     try:
-        await redis_client.ping()
-        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
-    except Exception:
-        sys.exit(f"redis not reachable — {remedy}")
-    finally:
-        await redis_client.aclose()
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
-            await conn.execute(text("TRUNCATE tool_baselines"))
-            await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
-            await conn.execute(text("TRUNCATE policy_versions"))
-    except Exception:
-        sys.exit(f"postgres not reachable — {remedy}")
+        await reset_dev_state(clear_snapshots=False)
+    except ResetError as exc:
+        sys.exit(str(exc))
 
 
 @asynccontextmanager
@@ -116,12 +100,12 @@ async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSes
         follow_redirects=True,
         timeout=httpx.Timeout(300.0),
     ) as http_client:
-        async with streamable_http_client(f"{gw.url}/mcp", http_client=http_client) as (
+        async with streamable_http_client(f"{gw.url}/mcp/default", http_client=http_client) as (
             read,
             write,
             _,
         ):
-            async with ReplayCompliantSession(read, write) as session:
+            async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
 
@@ -181,11 +165,7 @@ async def bench_single_call(gw: Gateway, n: int) -> dict[str, dict[str, float]]:
             call = functools.partial(session.call_tool, "read_file", {"path": "bench.txt"})
             await timed_calls(call, WARMUP_CALLS)
             gateway = dist(await timed_calls(call, n))
-            cold = dist(
-                await timed_calls(
-                    call, n, before_each=lambda: cache.invalidate(settings.upstream_server_id)
-                )
-            )
+            cold = dist(await timed_calls(call, n, before_each=lambda: cache.invalidate("default")))
     finally:
         await redis_client.aclose()
     return {"direct": direct, "gateway_cached": gateway, "gateway_cold": cold}

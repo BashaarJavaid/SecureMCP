@@ -23,11 +23,9 @@ MCP defines a JSON-RPC 2.0 transport between LLM clients and tool servers, but d
 
 SecurMCP sits between the two and closes those three.
 
-### Client compatibility — read this before you deploy it
+### Client compatibility
 
-The upstream server needs no changes. **The client currently does.** The Replay Guard requires every `tools/call` to carry a `securmcp/nonce` and `securmcp/timestamp` in `params._meta`, and denies the call (`DENY_REPLAY`) when they're missing — so a stock Claude Desktop or Cursor can complete `tools/list` (pruning works) but **every tool call it makes will be rejected**. The MCP SDK sends this natively via `call_tool(meta=...)`, so a custom agent is a two-line change; an off-the-shelf client is not.
-
-This is the wrong default and it's the first thing Phase 5 fixes: the replay posture becomes per-identity, so stock clients work with RBAC, ABAC, drift, risk, and audit all still enforced, and hardened clients opt into cryptographically-bound replay protection. See [`ROADMAP.md`](./ROADMAP.md) item 34.
+**Neither side needs changes.** The upstream server is proxied as-is, and a stock Claude Desktop, Cursor, or SDK `ClientSession` works unmodified under the default `bearer` auth mode — RBAC, ABAC, drift blocking, risk scoring, parameter validation, and the signed audit trail are all fully enforced on every call (the integration suite runs an unpatched SDK client end to end). Auth posture is per-identity ([`ROADMAP.md`](./ROADMAP.md) item 34): identities that can adopt a small signing client opt into `signed` mode, where the request carries a non-secret key id plus an HMAC over the call — no credential on the wire at all, which is what makes replay protection real (a captured request cannot be re-signed with a fresh nonce). The tradeoff is honest: `bearer` = zero client changes, key rides the request; `signed` = custom client, capture-proof.
 
 ---
 
@@ -73,7 +71,7 @@ graph TD
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-**v1 fronts exactly one upstream server.** `UPSTREAM_COMMAND` is a single command and `server_id` is a single constant. The policy schema's per-server grants and `"*"` wildcards are forward-compatible structure for a server registry that does not exist yet — it's the first item in Phase 5.
+**Multiple upstreams are registered in the policy's `servers:` block** (item 35): `server_id → stdio command`, versioned and rolled back with the rest of the policy. Clients connect to `/mcp/<server_id>`; one session is bound to one upstream, chosen at connect time. RBAC grants, drift baselines, schema caches, risk counters, and approvals are all keyed on the real `server_id`, so an identically-named tool on two servers is two different tools.
 
 ---
 
@@ -87,10 +85,10 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 | Rogue / rug-pulling MCP server (schema mutation) | Yes | Drift Detector classifies mutations; High/Critical blocks at `tools/call` until re-approval |
 | Contextually risky calls by an *authorized* identity | Yes | Risk Engine — challenge / human approval / deny, by score band |
 | Audit-log tampering | Yes | Hash chain + per-row ECDSA signature; independently verified by a sidecar holding only the public key |
-| Replay of a captured request | **Partial** | The nonce/timestamp are client-supplied and bound to no secret — this catches accidental resubmission, **not** an attacker who captured the request (the API key travels in that same request). Moving the secret off the wire is Phase 5 item 34 |
-| Tool Poisoning (adversarial text in descriptions) | **No** | Descriptions are forwarded to the LLM verbatim. A server poisoned at first contact becomes its own approved baseline; a later description change is `DRIFT_LOW`, logged but not blocked. Content analysis is Phase 5 |
+| Replay of a captured request | **Yes for `signed` / Partial for `bearer`** | A `signed` request carries no credential: a byte-identical replay is deduped (`DENY_REPLAY`) and a fresh nonce cannot be re-signed (401 at the edge). `bearer` keeps opportunistic dedup only — the API key travels in the captured request |
+| Tool Poisoning (adversarial text in descriptions) | **Partial** | A description changed after approval blocks until re-approval (default High, item 36a); first-contact baselines are heuristically scanned — a hit is audited (`BASELINE_FLAGGED`) and raises every later call's risk, but flags never block and novel phrasing evades pattern lists. Descriptions still reach the LLM verbatim — Partial is the ceiling |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
-| Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder |
+| Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
 | Insider admin abusing legitimate access | No | Attributable and tamper-evident after the fact, not prevented; two-person activation is designed, not built |
 
@@ -104,9 +102,8 @@ python scripts/run_demo.py               # resets demo state, mints keys, writes
 ```
 
 ```bash
-# in another terminal:
+# in another terminal (the rogue upstream command lives in the demo policy's servers: block):
 POLICY_FILE=policies/demo-policy.yaml \
-  UPSTREAM_COMMAND="python sample_target/rogue_server.py --state /rogue-state/state.json" \
   docker compose up -d --build
 
 # when the driver prompts — the rug pull, deliberately on screen:
@@ -116,9 +113,11 @@ curl -X POST localhost:9800/_admin/apply_mutation
 docker kill -s HUP securemcp-gateway-1
 ```
 
-The driver connects as `developer` (sees only `send_email` / `read_inbox` — the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call succeeding against the new schema, a byte-identical replay rejected (`DENY_REPLAY`), and finally a Policy Simulation replaying the demo's own traffic against the v2 draft (`would_now_deny: 3`) before printing the hash-chained audit receipts.
+The driver connects as `developer` — a stock MCP client, no custom `_meta` anywhere (sees only `send_email` / `read_inbox`; the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call succeeding against the new schema, then the `signed` ci-agent's captured request replayed byte-identically (`DENY_REPLAY`) and with a forged fresh nonce (HTTP 401 — the capture holds no credential to re-sign with), and finally a Policy Simulation replaying the demo's own traffic against the v2 draft (`would_now_deny: 3`) before printing the hash-chained audit receipts.
 
 All seven beats are live — nothing is scripted or faked. The mutation fires only when the operator actually calls that endpoint, so the adversarial event is visible on camera rather than happening off-screen on a timer.
+
+Afterwards, a plain `docker compose up` deliberately refuses to start: the demo's policy v1 is on record with different content, and the fail-closed activation check catches it. The startup error names the fix — `docker compose run --rm gateway python scripts/reset_dev_state.py --yes` (dev-only: wipes the local audit chain and demo state, never the check).
 
 **Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, then `.venv/bin/pytest`. Full command list in [`CLAUDE.md`](./CLAUDE.md).
 

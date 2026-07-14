@@ -1,8 +1,9 @@
 """FastAPI app entrypoint."""
 
 import asyncio
+import json
 import signal
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -35,6 +36,7 @@ from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
 from services.gateway.session_manager import SessionManager
+from services.gateway.step_up import ChallengeStore
 
 logging_config.configure()
 logger = structlog.get_logger(__name__)
@@ -69,6 +71,24 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
         logger.exception("audit_write_failed", event_type="POLICY_ACTIVATED")
 
 
+async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None:
+    """Boot-time activation record (item 19). A conflict here is almost always
+    leftover dev/demo state hitting the fail-closed monotonicity check — a good
+    security property with a terrible first-run experience (item 38). Startup
+    still fails, but with the remedy in the message; SIGHUP and rollback conflicts
+    keep their own handling, where a state wipe would be the wrong advice."""
+    try:
+        await policy_versions.record_activation(engine, "startup", async_session)
+    except policy_versions.ActivationError as exc:
+        hint = (
+            f"{exc} — leftover dev/demo state? reset with:"
+            " python scripts/reset_dev_state.py (in docker:"
+            " docker compose run --rm gateway python scripts/reset_dev_state.py --yes)"
+        )
+        logger.error("policy_activation_conflict_at_startup", detail=hint)
+        raise policy_versions.ActivationError(hint) from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
@@ -84,7 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (e.g. same version, different content) fails startup; the snapshot/row are
     # idempotent on a re-seen version but the audit row is unconditional, so every
     # boot's active policy — including one reverting a rollback — is in the chain.
-    await policy_versions.record_activation(store.engine, "startup", async_session)
+    await _record_startup_activation(store.engine)
     await writer.write(
         EventType.POLICY_ACTIVATED,
         "startup",
@@ -112,6 +132,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ReplayGuard(redis_client, settings.replay_window_seconds),
         risk_engine,
         approval_store,
+        ChallengeStore(redis_client),
     )
     app.state.session_manager = manager
     # §7 metrics on a separate internal-only listener — never the published app
@@ -186,13 +207,13 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=403, detail="admin identity required")
     approval_store: ApprovalStore = request.app.state.approval_store
     try:
-        seq, requester_id, tool_name = await approval_store.approve(
+        seq, requester_id, server_id, tool_name = await approval_store.approve(
             approval_id, approved_by=identity_id
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     risk_engine: RiskEngine = request.app.state.risk_engine
-    await risk_engine.apply_decay(requester_id, tool_name)
+    await risk_engine.apply_decay(requester_id, server_id, tool_name)
     decision = Decision(
         decision=DecisionOutcome.ALLOW,
         event_type=EventType.APPROVED,
@@ -296,6 +317,8 @@ async def get_decision(seq: int, request: Request) -> dict[str, object]:
 class ExplainRequest(BaseModel):
     identity: str
     tool: str
+    # Omitted + exactly one registered server -> that server; ambiguous -> 400.
+    server: str | None = None
     arguments: dict[str, Any] = {}
     context: dict[str, Any] = {}
 
@@ -306,12 +329,21 @@ async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, 
     §4.2 pipeline for a would-be call against the current in-memory policy — no
     audit rows, no approvals, no counter bumps, no upstream traffic."""
     await _require_admin(request)
+    engine = request.app.state.policy_store.engine
+    server_id = body.server
+    if server_id is None:
+        if len(engine.policy.servers) != 1:
+            raise HTTPException(
+                status_code=400, detail="multiple servers registered; specify `server`"
+            )
+        server_id = next(iter(engine.policy.servers))
     decision = await decision_explainer.explain_call(
         body.identity,
         body.tool,
+        server_id,
         body.arguments,
         body.context,
-        engine=request.app.state.policy_store.engine,
+        engine=engine,
         detector=request.app.state.drift_detector,
         risk=request.app.state.risk_engine,
         schema_cache=SchemaCache(request.app.state.redis),
@@ -360,20 +392,82 @@ async def simulate_policy(
     return result.model_dump(mode="json")
 
 
+async def _buffer_body(receive: Receive) -> tuple[bytes, Receive]:
+    """Drain the request body so the edge can verify a signed message before the
+    transport parses it, returning a replayable receive (item 34)."""
+    events: list[MutableMapping[str, Any]] = []
+    chunks: list[bytes] = []
+    while True:
+        event = await receive()
+        events.append(event)
+        if event["type"] != "http.request":
+            break
+        chunks.append(event.get("body", b""))
+        if not event.get("more_body"):
+            break
+
+    async def replay() -> MutableMapping[str, Any]:
+        if events:
+            return events.pop(0)
+        return await receive()
+
+    return b"".join(chunks), replay
+
+
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
-    """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport."""
+    """Raw ASGI endpoint: routes each request to its session's Streamable HTTP transport.
+
+    Path-based upstream routing (item 35): clients connect to /mcp/{server_id}; the
+    id must be registered in the policy's `servers:` block. One session = one
+    upstream, chosen here at connect time."""
     manager: SessionManager = scope["app"].state.session_manager
     headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
     session_id = headers.get(MCP_SESSION_ID_HEADER)
+    engine = scope["app"].state.policy_store.engine
+
+    # The mount keeps the full path and puts its own prefix in root_path.
+    server_id = scope["path"].removeprefix(scope.get("root_path", "")).strip("/")
 
     # Auth on every request, not just session creation (ARCHITECTURE.md §4.8).
-    identity_id = await auth.resolve_identity_tracked(
-        headers.get(KEY_HEADER),
-        scope["app"].state.policy_store.engine,
-        scope["app"].state.redis,
-    )
+    # Bearer: the key header, hash-and-lookup. Signed (item 34): no header — the
+    # POSTed message carries key id + HMAC in params._meta, verified here at the
+    # edge so a forged signature is an HTTP 401, never a parsed session message.
+    if headers.get(KEY_HEADER) is not None:
+        identity_id = await auth.resolve_identity_tracked(
+            headers.get(KEY_HEADER), engine, scope["app"].state.redis
+        )
+    elif scope["method"] == "POST":
+        body, receive = await _buffer_body(receive)
+        try:
+            message = json.loads(body)
+        except ValueError:
+            message = None
+        identity_id = None
+        if isinstance(message, dict):
+            identity_id = await auth.verify_signed_request_tracked(
+                message, engine, scope["app"].state.redis
+            )
+    else:
+        # GET (SSE stream) / DELETE carry no JSON-RPC body to sign. A signed
+        # session was created by a signature-verified initialize, so possession of
+        # its session id binds these to that identity (residual exposure — reading
+        # the response stream off a captured session id — is documented, item 34).
+        identity_id = None
+        if session_id is not None:
+            session = manager.get(session_id)
+            if session is not None:
+                identity = engine.identity(session.interceptor.identity_id)
+                if identity is not None and identity.auth_mode == "signed":
+                    identity_id = session.interceptor.identity_id
     if identity_id is None:
-        await Response("invalid or missing API key", status_code=401)(scope, receive, send)
+        await Response("invalid or missing API key or signature", status_code=401)(
+            scope, receive, send
+        )
+        return
+
+    # After auth, so an unauthenticated probe can't enumerate registered server ids.
+    if engine.server_command(server_id) is None:
+        await Response("unknown server", status_code=404)(scope, receive, send)
         return
 
     if session_id is not None:
@@ -387,12 +481,16 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
                 scope, receive, send
             )
             return
+        if session.interceptor.server_id != server_id:
+            # A session is bound to the upstream it was created against (item 35).
+            await Response("session not found", status_code=404)(scope, receive, send)
+            return
     elif scope["method"] == "POST":
         # A POST without a session header is a new session (the initialize request).
         # Any failure here — including the SESSION_START audit write — means no
         # session (§5: no record, no action).
         try:
-            session = await manager.create(identity_id)
+            session = await manager.create(identity_id, server_id)
         except Exception:
             logger.exception("session_creation_failed", identity=identity_id)
             await Response("session could not be created", status_code=503)(scope, receive, send)

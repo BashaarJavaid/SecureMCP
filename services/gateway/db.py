@@ -69,6 +69,9 @@ class ToolBaseline(Base):
     blocked: Mapped[bool] = mapped_column(default=False)
     observed_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     observed_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    # Item 36b: the approved content matched the description heuristics — feeds the
+    # suspicious_baseline risk factor; a flag, never a block.
+    suspicious: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
 
 class Approval(Base):
@@ -82,6 +85,9 @@ class Approval(Base):
     approval_id: Mapped[str] = mapped_column(Text, primary_key=True)
     audit_id: Mapped[int] = mapped_column(BigInteger)
     identity_id: Mapped[str] = mapped_column(Text)
+    # Approvals are per-server (item 35): an approval granted for a tool on one
+    # server must not redeem an identically-named tool on another.
+    server_id: Mapped[str] = mapped_column(Text, server_default=text("'default'"))
     tool_name: Mapped[str] = mapped_column(Text)
     arguments_hash: Mapped[str] = mapped_column(CHAR(64))
     created_at: Mapped[datetime] = mapped_column(

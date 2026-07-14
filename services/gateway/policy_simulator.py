@@ -251,6 +251,9 @@ async def _simulate_row(
     return await decision_explainer.explain_call(
         row.identity_id,
         row.tool_name or "",
+        # Decision rows always record their server; "" on a legacy row fails
+        # closed as DENY_RBAC.
+        row.server_id or "",
         arguments,
         {"timestamp": row.timestamp.timestamp()},
         engine=engine,

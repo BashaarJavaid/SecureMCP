@@ -1,9 +1,8 @@
-"""Parameter Validator end-to-end (§4.8): strict-mode rejection, DENY_VALIDATION
-auditing, and sanitization observable through the echo tool."""
+"""Parameter Validator end-to-end (§4.8): strict-mode rejection and DENY_VALIDATION
+auditing, including injection-pattern rejection (item 31), through the echo tool."""
 
 import pytest
 from mcp import McpError
-from mcp.types import TextContent
 from sqlalchemy import select
 
 from services.gateway.db import AuditLog, async_session
@@ -39,14 +38,19 @@ async def test_wrong_type_is_denied(gateway: Gateway) -> None:
         assert excinfo.value.error.data["event_type"] == "DENY_VALIDATION"
 
 
-async def test_sanitization_is_observable_end_to_end(gateway: Gateway) -> None:
+@pytest.mark.parametrize("text", ["....//etc/passwd", "..././etc/passwd", "a\x00b"])
+async def test_injection_patterns_are_denied_not_rewritten(gateway: Gateway, text: str) -> None:
+    # Item 31: the old sanitizer would have rewritten the first two into '../…'
+    # and forwarded them upstream. Rejection is the only fail-closed posture.
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
         await session.list_tools()
-        result = await session.call_tool("echo", {"text": "../../etc/passwd\x00"})
-        assert isinstance(result.content[0], TextContent)
-        assert result.content[0].text == "etc/passwd"  # upstream received cleaned args
+        with pytest.raises(McpError) as excinfo:
+            await session.call_tool("echo", {"text": text})
 
+    data = excinfo.value.error.data
+    assert data["event_type"] == "DENY_VALIDATION"
+    assert data["decision"] == "deny"
     rows = await fetch_rows()
-    allow = [r for r in rows if r.event_type == "ALLOW"][-1]
-    assert allow.payload["arguments"] == {"text": "etc/passwd"}
-    assert allow.payload["sanitized_fields"] == ["text"]
+    assert rows[-1].event_type == "DENY_VALIDATION"
+    assert "sanitized_fields" not in rows[-1].payload
+    assert data["audit_id"] == str(rows[-1].seq)

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 from types import SimpleNamespace
@@ -9,9 +10,9 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
-from services.gateway import logging_config
+from services.gateway import logging_config, risk_engine
 from services.gateway.approvals import APPROVAL_META_KEY
-from services.gateway.decision import EventType
+from services.gateway.decision import DecisionOutcome, EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
@@ -23,6 +24,7 @@ logging_config.configure()
 POLICY = PolicyFile.model_validate(
     {
         "version": 1,
+        "servers": {"default": "unused-command"},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -50,6 +52,7 @@ class FakeWriter:
         self,
         event_type: EventType,
         identity_id: str,
+        server_id: str | None = None,
         tool_name: str | None = None,
         payload_extra: dict[str, Any] | None = None,
         risk_score: int | None = None,
@@ -110,7 +113,12 @@ class FakeRisk:
         self.denial_error: Exception | None = None
 
     async def score(
-        self, identity_id: str, tool_name: str, arguments: dict[str, Any], risk_policy: Any
+        self,
+        identity_id: str,
+        server_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        risk_policy: Any,
     ) -> tuple[int, list[Any]]:
         if self.error is not None:
             raise self.error
@@ -128,13 +136,39 @@ class FakeApprovals:
         self.denial: tuple[EventType, str] | None = None
 
     async def redeem(
-        self, approval_id: str, identity_id: str, tool_name: str, args_hash: str
+        self, approval_id: str, identity_id: str, server_id: str, tool_name: str, args_hash: str
     ) -> tuple[EventType, str] | None:
         self.redeemed.append(approval_id)
         return self.denial
 
-    async def create(self, identity_id: str, tool_name: str, args_hash: str, audit_id: int) -> str:
+    async def create(
+        self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
+    ) -> str:
         return "approval-1"
+
+
+class FakeChallenges:
+    def __init__(self) -> None:
+        self.redeemed: list[str] = []
+        self.failure: str | None = None
+
+    async def redeem(
+        self,
+        challenge_id: str,
+        identity_id: str,
+        server_id: str,
+        tool_name: str,
+        args_hash: str,
+        proof: object,
+        secret_b32: str,
+    ) -> str | None:
+        self.redeemed.append(challenge_id)
+        return self.failure
+
+    async def create(
+        self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
+    ) -> str:
+        return "challenge-1"
 
 
 async def _no_upstream(message: JSONRPCMessage) -> None:
@@ -154,6 +188,7 @@ def make_interceptor(
         cache.data["default"] = [{"name": "echo", "inputSchema": ECHO_SCHEMA}]
     interceptor = Interceptor(
         identity_id=identity,
+        server_id="default",
         session_id="test-session",
         store=cast(Any, SimpleNamespace(engine=PolicyEngine(policy or POLICY))),
         writer=cast(Any, writer),
@@ -162,6 +197,7 @@ def make_interceptor(
         replay=cast(Any, FakeReplay()),
         risk=cast(Any, risk or FakeRisk()),
         approvals=cast(Any, FakeApprovals()),
+        challenges=cast(Any, FakeChallenges()),
         send_upstream=_no_upstream,
     )
     return interceptor, writer, cache, detector
@@ -171,6 +207,7 @@ def abac_policy(conditions: list[str], attributes: dict[str, Any] | None = None)
     return PolicyFile.model_validate(
         {
             "version": 1,
+            "servers": {"default": "unused-command"},
             "identities": [
                 {
                     "id": "agent-readonly",
@@ -384,14 +421,6 @@ async def test_invalid_arguments_are_denied_and_audited() -> None:
     assert writer.events == [EventType.DENY_VALIDATION]
 
 
-async def test_forwarded_arguments_are_sanitized() -> None:
-    interceptor, _, _, _ = make_interceptor()
-    message = request("tools/call", {"name": "echo", "arguments": {"text": "../a\x00b"}})
-    outcome = await interceptor.on_client_message(message)
-    assert isinstance(outcome, Forward)
-    assert outcome.message.message.root.params["arguments"] == {"text": "ab"}
-
-
 async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
     interceptor, writer, cache, detector = make_interceptor(with_schema=False)
     await interceptor.on_client_message(request("tools/list", id=7))
@@ -435,11 +464,53 @@ async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
     assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
 
 
-async def test_missing_nonce_is_denied_before_rbac() -> None:
-    # Replay is pipeline stage 1 (§4.2): even an RBAC-denied tool reports DENY_REPLAY.
+async def test_malformed_nonce_is_denied_before_rbac() -> None:
+    # Replay is pipeline stage 1 (§4.2): a volunteered-but-malformed nonce reports
+    # DENY_REPLAY even for an RBAC-denied tool (present → fully enforced, item 34).
     interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
-        request("tools/call", {"name": "delete_repo", "arguments": {}, "_meta": {}})
+        request(
+            "tools/call",
+            {"name": "delete_repo", "arguments": {}, "_meta": {NONCE_META_KEY: "not-a-uuid"}},
+        )
+    )
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
+    assert writer.events == [EventType.DENY_REPLAY]
+
+
+async def test_bearer_call_without_nonce_skips_replay_and_forwards() -> None:
+    # Item 34: a stock MCP client sends no securmcp _meta at all — bearer identities
+    # skip stage 1 entirely and the rest of the pipeline still runs.
+    interceptor, writer, _, _ = make_interceptor()
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": {}})
+    )
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.ALLOW]
+
+
+async def test_signed_identity_missing_nonce_is_denied() -> None:
+    # For signed identities the nonce/timestamp pair stays mandatory (item 34).
+    os.environ["INTERCEPTOR_TEST_SECRET"] = "s3cret"
+    policy = PolicyFile.model_validate(
+        {
+            "version": 1,
+            "servers": {"default": "unused-command"},
+            "identities": [
+                {
+                    "id": "agent-readonly",
+                    "auth_mode": "signed",
+                    "key_id": "kid_interceptor",
+                    "signing_secret_env": "INTERCEPTOR_TEST_SECRET",
+                    "allowed_servers": [{"server_id": "default", "allowed_tools": ["echo"]}],
+                }
+            ],
+        }
+    )
+    interceptor, writer, _, _ = make_interceptor(policy=policy)
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": {}})
     )
     assert isinstance(outcome, Respond)
     assert outcome.message.message.root.error.data["event_type"] == "DENY_REPLAY"
@@ -691,6 +762,30 @@ async def test_risk_threshold_boundaries(score: int, expected_event: EventType) 
         data = outcome.message.message.root.error.data
         assert data["event_type"] == expected_event.value
         assert data["risk_score"] == score
+
+
+@pytest.mark.parametrize("score", [45, 75, 95])
+async def test_moved_band_constants_keep_live_and_predicted_outcomes_agreeing(
+    monkeypatch: pytest.MonkeyPatch, score: int
+) -> None:
+    """Item 32 canary: shift every band constant, then assert live enforcement still
+    matches threshold_outcome() — the mapping the Decision Explainer predicts with.
+    Each score sits where the old inline comparisons (>= 40, >= 70, > 90) and the
+    shifted bands disagree, so this fails if the interceptor ever forks them again."""
+    monkeypatch.setattr(risk_engine, "RISK_CHALLENGE_MIN", 60)
+    monkeypatch.setattr(risk_engine, "RISK_APPROVAL_MIN", 80)
+    monkeypatch.setattr(risk_engine, "RISK_DENY_ABOVE", 96)
+    predicted = risk_engine.threshold_outcome(score)
+
+    interceptor, _, _, _ = make_interceptor(risk=FakeRisk(score))
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+    if isinstance(outcome, Forward):
+        live = DecisionOutcome.ALLOW
+    else:
+        live = DecisionOutcome(outcome.message.message.root.error.data["decision"])
+    assert live is predicted
 
 
 async def test_human_approval_decision_carries_approval_id() -> None:

@@ -8,16 +8,20 @@ import secrets
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import pytest
+import redis.asyncio as aioredis
 import yaml
 from mcp import McpError
 from mcp.types import TextContent
 from sqlalchemy import select
 
 from services.gateway import risk_engine
+from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
+from services.gateway.policy_engine import RiskPolicy
 from tests.adversarial.conftest import set_mutation, upstream_command
 from tests.integration.conftest import ECHO_SERVER, Gateway, _key_hash, running_gateway
 from tests.integration.test_policy_scoping import connect
@@ -126,8 +130,9 @@ async def drift_history_gateway(
 
 async def test_drift_history_survives_reapproval(drift_history_gateway: Gateway) -> None:
     gw = drift_history_gateway
-    # Baseline the pristine shape, then drift it twice at non-blocking severities
-    # (Low: description change; Medium: optional param) — two DRIFT_* audit events.
+    # Baseline the pristine shape, then drift it twice (High: description change,
+    # item 36a; Medium: optional param) — two DRIFT_* audit events. The block from
+    # the first drift is cleared by the re-approval below, before the scored call.
     async with connect(gw.url, gw.keys["agent"]) as session:
         await session.list_tools()
     for mutation in ("description", "optional_param"):
@@ -150,3 +155,39 @@ async def test_drift_history_survives_reapproval(drift_history_gateway: Gateway)
     factors = await allow_factors("send_email")
     assert "drift_history" in factors
     assert "drift_in_review" not in factors  # cleared by the approval, §4.8
+
+
+class _DriftInReview:
+    """Detector stub: the tool has unresolved observed drift, no drift history."""
+
+    async def has_pending_drift(self, server_id: str, tool_name: str) -> bool:
+        return True
+
+    async def recent_drift_count(self, server_id: str, tool_name: str, window: int) -> int:
+        return 0
+
+    async def is_suspicious(self, server_id: str, tool_name: str) -> bool:
+        return False
+
+
+async def test_fifty_approvals_cannot_zero_behavioral_scoring(
+    clean_audit: None, no_business_hours: None
+) -> None:
+    """Item 33: the decay offset is capped at risk_decay_max and expires, so a
+    rubber-stamped (identity, tool) pair still lands in the CHALLENGE band when a
+    frequency-spiking, denial-heavy call with drift in review arrives. Uncapped,
+    50 approvals would be a 250-point offset zeroing all 60 behavioral points."""
+    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    try:
+        engine = risk_engine.RiskEngine(redis_client, cast(Any, _DriftInReview()))
+        for _ in range(50):
+            await engine.apply_decay("agent", "default", "echo")
+        assert await redis_client.ttl("risk:decay:agent:default:echo") > 0  # ages out
+        for _ in range(4):  # past the >3-denials/window threshold
+            await engine.record_denial("agent")
+        score = 0
+        for _ in range(11):  # past the >10-calls/window frequency threshold
+            score, _ = await engine.score("agent", "default", "echo", {}, RiskPolicy())
+        assert score >= risk_engine.RISK_CHALLENGE_MIN
+    finally:
+        await redis_client.aclose()

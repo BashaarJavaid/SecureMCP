@@ -40,15 +40,14 @@ from mcp.types import (
     RequestId,
 )
 
-from services.gateway import abac, metrics, param_validator, schema_pruner
+from services.gateway import abac, auth, metrics, param_validator, schema_pruner, step_up
 from services.gateway.approvals import APPROVAL_META_KEY, ApprovalStore, arguments_hash
 from services.gateway.audit_log import AuditWriter
-from services.gateway.config import settings
 from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine, PolicyStore
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY, ReplayGuard
-from services.gateway.risk_engine import RiskEngine
+from services.gateway.risk_engine import RISK_DENY_ABOVE, RiskEngine, threshold_outcome
 from services.gateway.schema_cache import SchemaCache
 
 # Implementation-defined JSON-RPC error codes; the canonical Decision object (§4.3)
@@ -58,6 +57,29 @@ AUDIT_UNAVAILABLE_CODE = -32004
 
 _HANDLED_METHODS = frozenset({"initialize", "tools/list", "tools/call"})
 _REFETCH_TIMEOUT_S = 10
+
+# Gateway-facing _meta keys — consumed here, never forwarded upstream.
+_GATEWAY_META_KEYS = (
+    NONCE_META_KEY,
+    TIMESTAMP_META_KEY,
+    APPROVAL_META_KEY,
+    step_up.CHALLENGE_ID_META_KEY,
+    step_up.CHALLENGE_PROOF_META_KEY,
+    auth.KEY_ID_META_KEY,
+    auth.SIGNATURE_META_KEY,
+)
+
+
+def _strip_gateway_meta(params: dict[str, Any] | None) -> None:
+    if not params:
+        return
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return
+    for key in _GATEWAY_META_KEYS:
+        meta.pop(key, None)
+    if not meta:
+        params.pop("_meta", None)
 
 
 @dataclass
@@ -91,6 +113,7 @@ def _error(request_id: RequestId, code: int, message: str, data: object = None) 
 @dataclass
 class Interceptor:
     identity_id: str
+    server_id: str
     session_id: str
     store: PolicyStore
     writer: AuditWriter
@@ -99,6 +122,7 @@ class Interceptor:
     replay: ReplayGuard
     risk: RiskEngine
     approvals: ApprovalStore
+    challenges: step_up.ChallengeStore
     send_upstream: Callable[[JSONRPCMessage], Awaitable[None]]
     _pending: dict[RequestId, str] = field(default_factory=dict)  # request id -> method
     # Gateway-initiated upstream requests (transparent tools/list re-fetch): responses
@@ -129,7 +153,7 @@ class Interceptor:
         self._pending[root.id] = root.method
         if root.method == "initialize":
             # A fresh handshake is the trust boundary to re-verify against (§8).
-            await self.cache.invalidate(settings.upstream_server_id)
+            await self.cache.invalidate(self.server_id)
         elif root.method == "tools/call":
             # §7: decision-pipeline time only — the upstream round trip is not in here.
             start = time.perf_counter()
@@ -139,6 +163,9 @@ class Interceptor:
                 metrics.REQUEST_LATENCY.observe(time.perf_counter() - start)
         elif root.method not in _HANDLED_METHODS:
             self._log.info("passthrough_no_handler", method=root.method)
+        # Signed requests (item 34) carry key-id/signature/nonce on every method;
+        # none of the gateway's _meta keys belong upstream.
+        _strip_gateway_meta(root.params)
         return Forward(message)
 
     async def _authorize_call(
@@ -148,27 +175,36 @@ class Interceptor:
         tool_name = str(params.get("name", ""))
         arguments = params.get("arguments", {}) or {}
 
-        # Replay Guard (§4.2 stage 1, cheapest check first): nonce + timestamp from
-        # params._meta; missing/invalid fields and a Redis failure all deny (§5).
+        # Replay Guard (§4.2 stage 1, cheapest check first). Mandatory for signed
+        # identities — nonce/timestamp are members of the edge-verified signature, so
+        # a byte-identical replay dies here on dedup while a fresh nonce already died
+        # at the edge (401, unsignable). Opportunistic for bearer (item 34): a
+        # volunteered nonce/timestamp key is fully enforced (present-but-malformed
+        # denies, §5), both absent skips — that's what lets a stock MCP client call
+        # at all. Dedup is deliberately tools/call-only: replaying a captured
+        # tools/list re-reads a list, no action. Redis failure still denies (§5).
         meta = params.get("_meta") or {}
-        try:
-            replay_reason = await self.replay.check(
-                meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
-            )
-        except Exception:
-            self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
-            replay_reason = "replay guard unavailable"
-        if replay_reason is not None:
-            return await self._deny(
-                request,
-                tool_name,
-                EventType.DENY_REPLAY,
-                f"Replay detected: {replay_reason}",
-                ["replay_guard"],
-                arguments=arguments,
-            )
+        identity = self.engine.identity(self.identity_id)
+        signed_mode = identity is not None and identity.auth_mode == "signed"
+        if signed_mode or NONCE_META_KEY in meta or TIMESTAMP_META_KEY in meta:
+            try:
+                replay_reason = await self.replay.check(
+                    meta.get(NONCE_META_KEY), meta.get(TIMESTAMP_META_KEY)
+                )
+            except Exception:
+                self._log.exception("replay_check_failed_fail_closed", tool=tool_name)
+                replay_reason = "replay guard unavailable"
+            if replay_reason is not None:
+                return await self._deny(
+                    request,
+                    tool_name,
+                    EventType.DENY_REPLAY,
+                    f"Replay detected: {replay_reason}",
+                    ["replay_guard"],
+                    arguments=arguments,
+                )
 
-        grant = self.engine.matching_grant(self.identity_id, settings.upstream_server_id, tool_name)
+        grant = self.engine.matching_grant(self.identity_id, self.server_id, tool_name)
         if grant is None:
             return await self._deny_rbac(request, tool_name, arguments)
 
@@ -190,7 +226,7 @@ class Interceptor:
         # Schema drift status (§4.2 stage 5): a tool blocked on High/Critical drift is
         # denied until re-approval; a status lookup failure also denies (§5).
         try:
-            drift_blocked = await self.detector.is_blocked(settings.upstream_server_id, tool_name)
+            drift_blocked = await self.detector.is_blocked(self.server_id, tool_name)
         except Exception:
             self._log.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
             drift_blocked = True
@@ -205,6 +241,38 @@ class Interceptor:
                 arguments=arguments,
             )
 
+        # Step-up redemption (item 37): a retry carrying a challenge id + TOTP proof
+        # consumes the challenge and verifies the code — any failure is a terminal
+        # DENY_STEP_UP (§5). Success only sets a flag: unlike an approval, the call
+        # is still re-scored below, and a verified proof clears nothing but the
+        # CHALLENGE band.
+        challenge_id = meta.get(step_up.CHALLENGE_ID_META_KEY)
+        step_up_verified = False
+        if challenge_id is not None:
+            try:
+                failure = await self.challenges.redeem(
+                    str(challenge_id),
+                    self.identity_id,
+                    self.server_id,
+                    tool_name,
+                    arguments_hash(arguments),
+                    meta.get(step_up.CHALLENGE_PROOF_META_KEY),
+                    identity.totp_secret if identity is not None else "",
+                )
+            except Exception:
+                self._log.exception("challenge_redeem_failed_fail_closed", tool=tool_name)
+                failure = "challenge store unavailable"
+            if failure is not None:
+                return await self._deny(
+                    request,
+                    tool_name,
+                    EventType.DENY_STEP_UP,
+                    f"step-up verification failed: {failure}",
+                    ["step_up"],
+                    arguments=arguments,
+                )
+            step_up_verified = True
+
         # Risk Engine (§4.2 stage 6, before param validation). A retry carrying an
         # approval id redeems it instead of re-scoring: a human reviewed this exact
         # call (§4.8); RBAC/drift/replay above and param validation below still apply.
@@ -214,7 +282,11 @@ class Interceptor:
         if approval_id is not None:
             try:
                 denial = await self.approvals.redeem(
-                    str(approval_id), self.identity_id, tool_name, arguments_hash(arguments)
+                    str(approval_id),
+                    self.identity_id,
+                    self.server_id,
+                    tool_name,
+                    arguments_hash(arguments),
                 )
             except Exception:
                 self._log.exception("approval_redeem_failed_fail_closed", tool=tool_name)
@@ -232,7 +304,7 @@ class Interceptor:
         else:
             try:
                 risk_score, risk_factors = await self.risk.score(
-                    self.identity_id, tool_name, arguments, self.engine.policy.risk
+                    self.identity_id, self.server_id, tool_name, arguments, self.engine.policy.risk
                 )
             except Exception:
                 # A crashed risk calculation is maximum risk, not low risk (§5).
@@ -266,9 +338,12 @@ class Interceptor:
             )
             if denied is not None:
                 return denied
-            if risk_score >= 40:
+            risk_outcome = threshold_outcome(risk_score)
+            if risk_outcome is DecisionOutcome.CHALLENGE and step_up_verified:
+                pass  # the verified proof satisfies the challenge — continue (item 37)
+            elif risk_outcome is not DecisionOutcome.ALLOW:
                 return await self._risk_terminal(
-                    request, tool_name, arguments, risk_score, risk_factors
+                    request, tool_name, arguments, risk_outcome, risk_score, risk_factors
                 )
 
         # Parameter validation (§4.2 stage 7, §4.8): cache miss triggers a transparent
@@ -281,8 +356,6 @@ class Interceptor:
         error = param_validator.validate(arguments, input_schema)
         if error is not None:
             return await self._deny_validation(request, tool_name, arguments, error)
-        arguments, sanitized_fields = param_validator.sanitize(arguments)
-        params["arguments"] = arguments
 
         # ALLOW is recorded before the call is forwarded — no record, no action (§5).
         # matched_rules in the payload keeps GET /admin/decisions/{seq} faithful
@@ -291,16 +364,17 @@ class Interceptor:
             "arguments": arguments,
             "matched_rules": [f"policy-v{self.engine.version}:rbac"],
         }
-        if sanitized_fields:
-            payload_extra["sanitized_fields"] = sanitized_fields
         if risk_factors:
             payload_extra["risk_factors"] = [f.model_dump(mode="json") for f in risk_factors]
         if approval_id is not None:
             payload_extra["approval_id"] = str(approval_id)
+        if step_up_verified:
+            payload_extra["challenge_id"] = str(challenge_id)
         try:
             seq = await self.writer.write(
                 EventType.ALLOW,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
                 risk_score=risk_score,
@@ -317,25 +391,21 @@ class Interceptor:
             audit_id=str(seq),
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, EventType.ALLOW.value
+            self.identity_id, self.server_id, tool_name, EventType.ALLOW.value
         ).inc()
-        # The nonce/timestamp/approval-id trio is gateway-facing only — never upstream.
-        meta.pop(NONCE_META_KEY, None)
-        meta.pop(TIMESTAMP_META_KEY, None)
-        meta.pop(APPROVAL_META_KEY, None)
-        if not meta:
-            params.pop("_meta", None)
+        _strip_gateway_meta(params)
         return Forward(message)
 
     def _abac_attributes(self, tool_name: str, meta: dict[str, Any]) -> dict[str, abac.AttrValue]:
         """The attribute universe conditions resolve against (§4.8): identity.* from
         the policy identity record (identity.id from the id itself), tool.* from the
-        current call, context.hour from the replay timestamp (already validated by
-        stage 1) in UTC. risk.score is bound later, once stage 6 has scored."""
+        current call, context.hour in UTC from the replay timestamp (already validated
+        by stage 1) or, when a bearer call carries none (item 34), the gateway's own
+        clock. risk.score is bound later, once stage 6 has scored."""
         attrs: dict[str, abac.AttrValue] = {
             "identity.id": self.identity_id,
             "tool.name": tool_name,
-            "tool.server_id": settings.upstream_server_id,
+            "tool.server_id": self.server_id,
         }
         identity = self.engine.identity(self.identity_id)
         if identity is not None:
@@ -344,6 +414,8 @@ class Interceptor:
         timestamp = meta.get(TIMESTAMP_META_KEY)
         if not isinstance(timestamp, bool) and isinstance(timestamp, int | float):
             attrs["context.hour"] = datetime.fromtimestamp(timestamp, UTC).hour
+        else:
+            attrs["context.hour"] = datetime.now(UTC).hour
         return attrs
 
     async def _enforce_conditions(
@@ -375,6 +447,7 @@ class Interceptor:
                     await self.writer.write(
                         EventType.POLICY_ERROR,
                         self.identity_id,
+                        server_id=self.server_id,
                         tool_name=tool_name,
                         payload_extra={"condition": condition.source, "reason": problem},
                     )
@@ -400,7 +473,7 @@ class Interceptor:
         return None
 
     async def _input_schema_for(self, tool_name: str) -> dict[str, Any] | None:
-        tools = await self.cache.get(settings.upstream_server_id)
+        tools = await self.cache.get(self.server_id)
         if tools is None:
             tools = await self._refetch_tools()
             if tools is None:
@@ -423,8 +496,8 @@ class Interceptor:
             )
             result = await asyncio.wait_for(future, timeout=_REFETCH_TIMEOUT_S)
             tools: list[dict[str, Any]] = result.get("tools", [])
-            await self.detector.check(settings.upstream_server_id, tools, self.identity_id)
-            await self.cache.put(settings.upstream_server_id, tools)
+            await self.detector.check(self.server_id, tools, self.identity_id)
+            await self.cache.put(self.server_id, tools)
         except Exception:
             self._log.exception("tools_list_refetch_failed")
             return None
@@ -445,8 +518,8 @@ class Interceptor:
     ) -> Respond:
         """Terminal deny: canonical Decision (§4.3) in error.data, audited with the
         row seq as audit_id. The deny stands even if the audit write fails.
-        arguments (raw, pre-sanitize) land in the payload so Policy Simulation can
-        replay denied calls too (item 21); rows written before then lack them."""
+        arguments land in the payload so Policy Simulation can replay denied
+        calls too (item 21); rows written before then lack them."""
         self._pending.pop(request.id, None)
         try:
             # Prior-denial-rate telemetry (§4.8, item 18): best-effort — a counting
@@ -475,6 +548,7 @@ class Interceptor:
             seq = await self.writer.write(
                 event_type,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra=payload_extra,
                 risk_score=risk_score,
@@ -492,7 +566,7 @@ class Interceptor:
             audit_id=decision.audit_id,
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+            self.identity_id, self.server_id, tool_name, event_type.value
         ).inc()
         if event_type is EventType.DENY_REPLAY:
             metrics.REPLAY_DENIED.inc()
@@ -508,38 +582,44 @@ class Interceptor:
         request: JSONRPCRequest,
         tool_name: str,
         arguments: dict[str, Any],
+        outcome: DecisionOutcome,
         risk_score: int,
         risk_factors: list[RiskFactor],
     ) -> Respond:
-        """Stage 6 terminal outcomes (§4.8 thresholds): 40-69 CHALLENGE, 70-90
-        HUMAN_APPROVAL_REQUIRED (creates the approvals row), >90 DENY_RISK. No
+        """Stage 6 terminal outcomes, branched on threshold_outcome()'s mapping —
+        the bands live only in risk_engine (item 32): CHALLENGE,
+        HUMAN_APPROVAL_REQUIRED (creates the approvals row), or DENY_RISK. No
         upstream forward in any of these; the canonical Decision travels in
         error.data with the score and contributing factors."""
-        if risk_score > 90:
+        if outcome is DecisionOutcome.DENY:
             return await self._deny(
                 request,
                 tool_name,
                 EventType.DENY_RISK,
-                f"risk score {risk_score} for {tool_name!r} exceeds the deny threshold (90)",
+                f"risk score {risk_score} for {tool_name!r} exceeds the deny"
+                f" threshold ({RISK_DENY_ABOVE})",
                 ["risk_engine"],
                 risk_score=risk_score,
                 risk_factors=risk_factors,
                 arguments=arguments,
             )
         self._pending.pop(request.id, None)
-        if risk_score >= 70:
-            outcome = DecisionOutcome.HUMAN_APPROVAL_REQUIRED
+        identity = self.engine.identity(self.identity_id)
+        step_up_capable = identity is not None and bool(identity.totp_secret)
+        if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
             event_type = EventType.HUMAN_APPROVAL_REQUIRED
             reason = (
                 f"risk score {risk_score} for {tool_name!r} requires human approval;"
                 " retry with the approval id once granted"
             )
         else:
-            # v1 challenge is terminal: a distinct error the client surfaces to a
-            # human for confirmation; a real step-up auth flow is Phase 4 (§4.8).
-            outcome = DecisionOutcome.CHALLENGE
+            # Step-up auth (item 37): an identity with a TOTP factor gets a
+            # redeemable challenge; without one the CHALLENGE stays a terminal
+            # error the client can only surface to a human.
             event_type = EventType.CHALLENGE
             reason = f"risk score {risk_score} for {tool_name!r} requires confirmation"
+            if step_up_capable:
+                reason += "; retry with the challenge id and a fresh TOTP code"
         decision = Decision(
             decision=outcome,
             event_type=event_type,
@@ -553,6 +633,7 @@ class Interceptor:
             seq = await self.writer.write(
                 event_type,
                 self.identity_id,
+                server_id=self.server_id,
                 tool_name=tool_name,
                 payload_extra={
                     "reason": reason,
@@ -564,10 +645,15 @@ class Interceptor:
             )
             decision.audit_id = str(seq)
             if outcome is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
-                # The approvals row references this audit seq (§4.8) — audit-first,
-                # and the hash is over the pre-sanitize arguments (see approvals.py).
+                # The approvals row references this audit seq (§4.8) — audit-first.
                 decision.approval_id = await self.approvals.create(
-                    self.identity_id, tool_name, arguments_hash(arguments), seq
+                    self.identity_id, self.server_id, tool_name, arguments_hash(arguments), seq
+                )
+            elif step_up_capable:
+                # Same audit-first shape (item 37): no challenge record, no
+                # redeemable challenge.
+                decision.challenge_id = await self.challenges.create(
+                    self.identity_id, self.server_id, tool_name, arguments_hash(arguments), seq
                 )
         except Exception:
             # No record (or no approval row) means the call cannot proceed anyway,
@@ -584,9 +670,10 @@ class Interceptor:
             risk_score=risk_score,
             audit_id=decision.audit_id,
             approval_id=decision.approval_id,
+            challenge_id=decision.challenge_id,
         )
         metrics.TOOL_CALLS.labels(
-            self.identity_id, settings.upstream_server_id, tool_name, event_type.value
+            self.identity_id, self.server_id, tool_name, event_type.value
         ).inc()
         return _error(
             request.id,
@@ -646,16 +733,14 @@ class Interceptor:
     ) -> SessionMessage:
         full = response.result.get("tools", [])
         try:
-            await self.detector.check(settings.upstream_server_id, full, self.identity_id)
+            await self.detector.check(self.server_id, full, self.identity_id)
         except Exception:
             self._log.exception("drift_check_failed_fail_closed")
             return _error(
                 response.id, AUDIT_UNAVAILABLE_CODE, "drift check unavailable; tools/list denied"
             ).message
-        schema_hash = await self.cache.put(settings.upstream_server_id, full)
-        served = schema_pruner.prune(
-            full, self.identity_id, settings.upstream_server_id, self.engine
-        )
+        schema_hash = await self.cache.put(self.server_id, full)
+        served = schema_pruner.prune(full, self.identity_id, self.server_id, self.engine)
         response.result["tools"] = served
         # §8 ETag, realized as result metadata (per-message conditional HTTP semantics
         # don't exist over the streamed transport).
@@ -666,6 +751,7 @@ class Interceptor:
             await self.writer.write(
                 EventType.TOOLS_LIST,
                 self.identity_id,
+                server_id=self.server_id,
                 payload_extra={"served_tools": served_names, "pruned_tools": pruned_names},
             )
         except Exception:

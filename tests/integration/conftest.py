@@ -8,80 +8,85 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-import redis.asyncio as aioredis
 import uvicorn
 import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from mcp import ClientSession
-from mcp.shared.session import ProgressFnT
-from mcp.types import CallToolResult
-from sqlalchemy import text
+from mcp.types import NotificationParams, PaginatedRequestParams, RequestParams
 
-from services.gateway.audit_log import POINTER_KEY
+from scripts.reset_dev_state import ResetError, reset_dev_state
+from services.gateway import auth
 from services.gateway.config import settings
-from services.gateway.db import Base, engine
+from services.gateway.db import engine
 from services.gateway.main import app
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
 ECHO_SERVER = Path(__file__).parent / "fixtures" / "echo_server.py"
 
+SIGNED_SECRET_ENV = "SECURMCP_TEST_SIGNING_SECRET"
 
-class ReplayCompliantSession(ClientSession):
-    """ClientSession whose call_tool carries the Replay Guard's nonce/timestamp pair
-    (fresh per call) unless the test supplies its own via `meta=`."""
 
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        read_timeout_seconds: timedelta | None = None,
-        progress_callback: ProgressFnT | None = None,
-        *,
-        meta: dict[str, Any] | None = None,
-    ) -> CallToolResult:
+class SignedSession(ClientSession):
+    """ClientSession for a `signed` identity (item 34): every outgoing request AND
+    notification carries key id, nonce/timestamp, and an HMAC over the canonical
+    tuple in params._meta — the wire format a custom signing client implements.
+    (Client→server *responses* — server-initiated sampling — are not signed; the
+    echo/rogue upstreams never send them.)"""
+
+    def __init__(self, *args: Any, key_id: str, secret: bytes, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._key_id = key_id
+        self._secret = secret
+
+    def _sign(self, root: Any) -> None:
+        nonce, timestamp = str(uuid.uuid4()), int(time.time())
+        params = root.params
+        if root.method == "tools/call":
+            tool, arguments = params.name, params.arguments
+        else:
+            tool, arguments = None, None
+        signature = auth.sign_request(self._secret, nonce, timestamp, root.method, tool, arguments)
         meta = {
-            NONCE_META_KEY: str(uuid.uuid4()),
-            TIMESTAMP_META_KEY: time.time(),
-            **(meta or {}),
+            NONCE_META_KEY: nonce,
+            TIMESTAMP_META_KEY: timestamp,
+            auth.KEY_ID_META_KEY: self._key_id,
+            auth.SIGNATURE_META_KEY: signature,
         }
-        return await super().call_tool(
-            name, arguments, read_timeout_seconds, progress_callback, meta=meta
-        )
+        if params is None:
+            cls = (
+                NotificationParams
+                if root.method.startswith("notifications/")
+                else PaginatedRequestParams
+            )
+            root.params = cls.model_validate({"_meta": meta})
+        else:
+            params.meta = RequestParams.Meta.model_validate(meta)
+
+    async def send_request(self, request: Any, result_type: Any, **kwargs: Any) -> Any:
+        self._sign(request.root)
+        return await super().send_request(request, result_type, **kwargs)
+
+    async def send_notification(self, notification: Any, **kwargs: Any) -> None:
+        self._sign(notification.root)
+        await super().send_notification(notification, **kwargs)
 
 
 @pytest.fixture
 async def clean_audit() -> None:
     """Skip unless postgres + redis are reachable; start each test from an empty,
-    consistent chain (empty audit_log AND no stale latest_audit_hash pointer)."""
-    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    try:
-        await redis_client.ping()
-        await redis_client.delete(POINTER_KEY, f"schema:{settings.upstream_server_id}")
-        risk_keys = await redis_client.keys("risk:*")
-        if risk_keys:
-            await redis_client.delete(*risk_keys)
-    except Exception:
-        pytest.skip("redis not reachable — run: docker compose up -d redis")
-    finally:
-        await redis_client.aclose()
+    consistent chain via the shared item-38 reset. Snapshots stay untouched — the
+    per-test revisions dir is only patched in later, by running_gateway."""
     # Each test runs in a fresh event loop; drop connections pooled under the old one.
     await engine.dispose()
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
-            await conn.execute(text("TRUNCATE tool_baselines"))
-            await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
-            await conn.execute(text("TRUNCATE approvals"))
-            await conn.execute(text("TRUNCATE policy_versions"))
-    except Exception:
-        pytest.skip("postgres not reachable — run: docker compose up -d postgres")
+        await reset_dev_state(clear_snapshots=False)
+    except ResetError as exc:
+        pytest.skip(str(exc))
 
 
 @dataclass
@@ -100,6 +105,7 @@ def policy_dict(
 ) -> dict:
     return {
         "version": version,
+        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -141,14 +147,18 @@ def write_signing_keypair(directory: Path) -> tuple[Path, Path]:
 async def running_gateway(
     policy_path: Path, upstream_command: str, keys: dict[str, str]
 ) -> AsyncIterator[Gateway]:
-    """The gateway app on an ephemeral port with the given policy file and upstream."""
+    """The gateway app on an ephemeral port with the given policy file and upstream.
+    A policy without a `servers:` block (the single-server fixtures) gets the given
+    command registered as "default" — item 35's registry, transparently."""
+    policy = yaml.safe_load(policy_path.read_text())
+    if "servers" not in policy:
+        policy["servers"] = {"default": upstream_command}
+        policy_path.write_text(yaml.safe_dump(policy))
     old_policy_file = settings.policy_file
-    old_command = settings.upstream_command
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file
     old_revisions_dir = settings.policy_revisions_dir
     settings.policy_file = str(policy_path)
-    settings.upstream_command = upstream_command
     settings.policy_revisions_dir = str(policy_path.parent / "revisions")
     private_path, public_path = write_signing_keypair(policy_path.parent)
     settings.signing_key_file = str(private_path)
@@ -166,7 +176,6 @@ async def running_gateway(
         yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
     finally:
         settings.policy_file = old_policy_file
-        settings.upstream_command = old_command
         settings.signing_key_file = old_signing_key
         settings.signing_public_key_file = old_signing_pub
         settings.policy_revisions_dir = old_revisions_dir
@@ -177,7 +186,8 @@ async def running_gateway(
 @pytest.fixture
 async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
     """Echo fixture upstream, with a policy file generated at runtime so no
-    real-looking API keys ever land in the repo."""
+    real-looking API keys ever land in the repo. Identities are plain `bearer` —
+    every test on this fixture doubles as proof that a stock MCP client works."""
     keys = {
         "agent-readonly": secrets.token_urlsafe(32),
         "agent-full": secrets.token_urlsafe(32),
@@ -186,3 +196,40 @@ async def gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
     policy_path.write_text(yaml.safe_dump(policy_dict(keys)))
     async with running_gateway(policy_path, f"{sys.executable} {ECHO_SERVER}", keys) as gw:
         yield gw
+
+
+@dataclass
+class SignedGateway:
+    url: str
+    key_id: str
+    secret: bytes
+    policy_path: Path
+
+
+@pytest.fixture
+async def signed_gateway(
+    clean_audit: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[SignedGateway]:
+    """Echo fixture upstream behind a single `signed` identity (item 34): the secret
+    lives only in an env var; the policy YAML carries the key id + the var's name."""
+    key_id = f"kid_{secrets.token_hex(8)}"
+    secret = secrets.token_urlsafe(32)
+    monkeypatch.setenv(SIGNED_SECRET_ENV, secret)
+    policy = {
+        "version": 1,
+        "identities": [
+            {
+                "id": "ci-agent",
+                "auth_mode": "signed",
+                "key_id": key_id,
+                "signing_secret_env": SIGNED_SECRET_ENV,
+                "allowed_servers": [{"server_id": "*", "allowed_tools": ["*"]}],
+            }
+        ],
+    }
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(yaml.safe_dump(policy))
+    async with running_gateway(policy_path, f"{sys.executable} {ECHO_SERVER}", {}) as gw:
+        yield SignedGateway(
+            url=gw.url, key_id=key_id, secret=secret.encode(), policy_path=policy_path
+        )

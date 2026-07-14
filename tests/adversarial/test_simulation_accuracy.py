@@ -29,6 +29,7 @@ def _policy(keys: dict[str, str], version: int, conditions: list[str] | None = N
         grant["conditions"] = conditions
     return {
         "version": version,
+        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
         "identities": [
             {
                 "id": "agent",

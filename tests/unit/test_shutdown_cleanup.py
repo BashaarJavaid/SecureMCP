@@ -37,6 +37,7 @@ def make_manager_with(processes: list[FakeProcess]) -> SessionManager:
         cast(Any, None),
         cast(Any, None),
         cast(Any, None),
+        cast(Any, None),
     )
     for i, process in enumerate(processes):
         session = Session(

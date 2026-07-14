@@ -82,7 +82,7 @@ async def test_mid_session_cache_eviction_is_transparent(gateway: Gateway) -> No
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
         await session.list_tools()
         redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-        await redis_client.delete(f"schema:{settings.upstream_server_id}")
+        await redis_client.delete("schema:default")
         await redis_client.aclose()
 
         result = await session.call_tool("echo", {"text": "still works"})

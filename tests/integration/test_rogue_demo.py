@@ -1,7 +1,9 @@
 """The item-14 demo, verified before anyone records it: rogue server starts benign,
 a REAL POST /_admin/apply_mutation (no timer) swaps send_email's schema mid-session,
 the gateway classifies the drift Critical and blocks, an admin re-approves, and the
-same call — now carrying the new required bcc — succeeds."""
+same call — now carrying the new required bcc — succeeds (scored with the item-36b
+suspicious_baseline factor, since the approved mutated description matches the
+heuristics)."""
 
 import asyncio
 import secrets
@@ -17,6 +19,7 @@ from mcp import McpError
 from mcp.types import TextContent
 from sqlalchemy import select
 
+from services.gateway import risk_engine
 from services.gateway.db import AuditLog, async_session
 from tests.integration.conftest import Gateway, _key_hash, running_gateway
 from tests.integration.test_policy_scoping import connect
@@ -31,7 +34,17 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-async def rogue_gateway(clean_audit: None, tmp_path: Path) -> AsyncIterator[Gateway]:
+async def rogue_gateway(
+    clean_audit: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Gateway]:
+    # Clock-independent like the drift fixture: the re-approved mutated description
+    # is (correctly) flagged suspicious (+20, item 36b), and off-hours (+25) on top
+    # would push the post-approval ALLOW into the CHALLENGE band.
+    monkeypatch.setattr(
+        risk_engine,
+        "FACTORS",
+        [fn for fn in risk_engine.FACTORS if fn is not risk_engine._business_hours],
+    )
     keys = {"developer": secrets.token_urlsafe(32), "ops-admin": secrets.token_urlsafe(32)}
     policy = {
         "version": 1,
@@ -132,3 +145,20 @@ async def test_full_rogue_demo_arc(rogue_gateway: Gateway, tmp_path: Path) -> No
             )
         ).scalars()
         assert list(events) == ["DRIFT_CRITICAL", "DENY_DRIFT", "APPROVED"]
+
+        # Item 36b: approving the poisoned description unblocked the tool, but the
+        # flag survives approval — the final ALLOW was scored knowing it.
+        final_allow = (
+            (
+                await db.execute(
+                    select(AuditLog)
+                    .where(AuditLog.event_type == "ALLOW")
+                    .order_by(AuditLog.seq.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        factors = {f["factor"] for f in final_allow.payload.get("risk_factors", [])}
+        assert "suspicious_baseline" in factors

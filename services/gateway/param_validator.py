@@ -1,8 +1,10 @@
-"""JSON Schema validation + sanitization on tools/call args (ARCHITECTURE.md §4.8).
+"""JSON Schema validation on tools/call args (ARCHITECTURE.md §4.8).
 
 Defense-in-depth, not a replacement for the upstream server's own validation.
 "strict mode": unknown argument keys are rejected even when the schema doesn't say
 `additionalProperties: false` — that's the part vanilla jsonschema doesn't give.
+Injection patterns in string values are rejected outright (item 31): rewriting
+attacker input and forwarding it is the one place the §4.2 pipeline failed open.
 """
 
 import re
@@ -12,6 +14,21 @@ import jsonschema
 
 # Null bytes and control characters (tab/newline kept), plus path-traversal sequences.
 _INJECTION = re.compile(r"\.\./|\.\.\\|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _find_injection(value: Any, path: str) -> str | None:
+    """Dotted path of the first string value matching _INJECTION, however nested."""
+    if isinstance(value, str) and _INJECTION.search(value):
+        return path
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if hit := _find_injection(v, f"{path}.{k}" if path else str(k)):
+                return hit
+    if isinstance(value, list):
+        for i, v in enumerate(value):
+            if hit := _find_injection(v, f"{path}[{i}]"):
+                return hit
+    return None
 
 
 def validate(arguments: dict[str, Any], input_schema: dict[str, Any]) -> str | None:
@@ -28,25 +45,7 @@ def validate(arguments: dict[str, Any], input_schema: dict[str, Any]) -> str | N
     except jsonschema.SchemaError as exc:
         # A broken upstream schema can't validate anything — fail closed.
         return f"tool schema itself is invalid: {exc.message}"
+    for key, value in arguments.items():
+        if hit := _find_injection(value, key):
+            return f"path traversal or control character in argument {hit!r}"
     return None
-
-
-def sanitize(arguments: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Strip injection patterns from all string values, however nested.
-    Returns the cleaned copy and the dotted paths of fields that were modified."""
-    touched: list[str] = []
-
-    def walk(value: Any, path: str) -> Any:
-        if isinstance(value, str):
-            cleaned = _INJECTION.sub("", value)
-            if cleaned != value:
-                touched.append(path)
-            return cleaned
-        if isinstance(value, dict):
-            return {k: walk(v, f"{path}.{k}" if path else str(k)) for k, v in value.items()}
-        if isinstance(value, list):
-            return [walk(v, f"{path}[{i}]") for i, v in enumerate(value)]
-        return value
-
-    cleaned = {k: walk(v, k) for k, v in arguments.items()}
-    return cleaned, touched

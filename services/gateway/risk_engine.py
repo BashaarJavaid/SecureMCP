@@ -7,8 +7,10 @@ them (a common-interface function list, deliberately not a plugin system) into a
 
 Risk decay (§4.8): a per-(identity, tool) Redis counter, incremented on each admin
 approval, discounts the *behavioral* subtotal (call frequency, prior-denial-rate,
-drift-in-review) — never the static tool-sensitivity tier — floored at 0, so
-rubber-stamp approvals can't desensitize the engine to an inherently dangerous tool.
+drift-in-review) — never the static tool-sensitivity tier — floored at 0. The
+offset is clamped to risk_decay_max at read time and the counter expires (item 33),
+so rubber-stamp approvals dampen behavioral scoring but can't switch it off, and
+never desensitize the engine to an inherently dangerous tool's static tier.
 
 Item 18 telemetry: prior-denial-rate (per-identity Redis rolling counter, bumped by
 the interceptor on every DENY_* terminal), auth-failures (the Auth Layer's gateway-
@@ -46,6 +48,7 @@ DRIFT_IN_REVIEW_CONTRIBUTION = 15
 PRIOR_DENIAL_CONTRIBUTION = 25
 AUTH_FAILURE_CONTRIBUTION = 20
 DRIFT_HISTORY_CONTRIBUTION = 15
+SUSPICIOUS_BASELINE_CONTRIBUTION = 20
 
 # Factors risk decay may discount — §4.8 names them exactly: call frequency,
 # prior-denial-rate, drift-in-review; never the tier, and deliberately not
@@ -66,6 +69,7 @@ class RiskContext:
     denial_count: int  # DENY_* terminals for this identity in the rolling window
     auth_failure_count: int  # gateway-wide failed key lookups in the rolling window
     drift_event_count: int  # DRIFT_* audit events for this tool in the rolling window
+    suspicious_baseline: bool  # approved content matched the item-36b heuristics
 
 
 def _string_values(value: Any) -> Iterator[str]:
@@ -181,6 +185,21 @@ def _drift_history(ctx: RiskContext) -> RiskFactor | None:
     )
 
 
+def _suspicious_baseline(ctx: RiskContext) -> RiskFactor | None:
+    # Item 36b: a property of the tool's approved content, like the sensitivity
+    # tier — deliberately not in BEHAVIORAL_FACTORS, so approvals can't decay it.
+    if not ctx.suspicious_baseline:
+        return None
+    return RiskFactor(
+        factor="suspicious_baseline",
+        contribution=SUSPICIOUS_BASELINE_CONTRIBUTION,
+        reason=(
+            f"{ctx.tool_name!r}'s approved description matched instruction-injection"
+            " heuristics when it was baselined"
+        ),
+    )
+
+
 FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _tool_sensitivity,
     _blast_radius,
@@ -190,31 +209,39 @@ FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _prior_denial_rate,
     _auth_failures,
     _drift_history,
+    _suspicious_baseline,
 ]
 
 
-def _freq_key(identity_id: str, tool_name: str) -> str:
-    return f"risk:freq:{identity_id}:{tool_name}"
+def _freq_key(identity_id: str, server_id: str, tool_name: str) -> str:
+    return f"risk:freq:{identity_id}:{server_id}:{tool_name}"
 
 
-def _decay_key(identity_id: str, tool_name: str) -> str:
-    return f"risk:decay:{identity_id}:{tool_name}"
+def _decay_key(identity_id: str, server_id: str, tool_name: str) -> str:
+    return f"risk:decay:{identity_id}:{server_id}:{tool_name}"
 
 
 def _denial_key(identity_id: str) -> str:
     return f"risk:denials:{identity_id}"
 
 
+# The §4.8 threshold bands: <40 continue (allow), 40-69 CHALLENGE, 70-90
+# HUMAN_APPROVAL_REQUIRED, >90 DENY. Compared only in threshold_outcome() (item 32).
+RISK_CHALLENGE_MIN = 40
+RISK_APPROVAL_MIN = 70
+RISK_DENY_ABOVE = 90
+
+
 def threshold_outcome(score: int) -> DecisionOutcome:
-    """The §4.8 threshold bands as a pure mapping: <40 continue (allow), 40-69
-    CHALLENGE, 70-90 HUMAN_APPROVAL_REQUIRED, >90 DENY. The interceptor keeps its
-    own inline branches (it also picks event types and reasons); this exists for
-    the Decision Explanation API (item 20) and its `alternative` field."""
-    if score > 90:
+    """The §4.8 threshold bands as a pure mapping — the single source of truth
+    (item 32): the interceptor branches on this for live enforcement, and the
+    Decision Explanation API (item 20) uses it for predictions and `alternative`,
+    so the two can't fork."""
+    if score > RISK_DENY_ABOVE:
         return DecisionOutcome.DENY
-    if score >= 70:
+    if score >= RISK_APPROVAL_MIN:
         return DecisionOutcome.HUMAN_APPROVAL_REQUIRED
-    if score >= 40:
+    if score >= RISK_CHALLENGE_MIN:
         return DecisionOutcome.CHALLENGE
     return DecisionOutcome.ALLOW
 
@@ -235,6 +262,7 @@ class RiskEngine:
     async def score(
         self,
         identity_id: str,
+        server_id: str,
         tool_name: str,
         arguments: dict[str, Any],
         risk_policy: RiskPolicy,
@@ -245,9 +273,9 @@ class RiskEngine:
         what a live call would score — the frequency counter is read + 1 instead
         of INCRed, so explaining never mutates telemetry."""
         if dry_run:
-            call_count = await self._counter(_freq_key(identity_id, tool_name)) + 1
+            call_count = await self._counter(_freq_key(identity_id, server_id, tool_name)) + 1
         else:
-            call_count = await self._bump_frequency(identity_id, tool_name)
+            call_count = await self._bump_frequency(identity_id, server_id, tool_name)
         ctx = RiskContext(
             identity_id=identity_id,
             tool_name=tool_name,
@@ -255,23 +283,23 @@ class RiskEngine:
             policy=risk_policy,
             now=datetime.now(UTC),
             call_count=call_count,
-            drift_in_review=await self._detector.has_pending_drift(
-                settings.upstream_server_id, tool_name
-            ),
+            drift_in_review=await self._detector.has_pending_drift(server_id, tool_name),
             denial_count=await self._counter(_denial_key(identity_id)),
             auth_failure_count=await self._counter(auth.AUTH_FAILURE_KEY),
             drift_event_count=await self._detector.recent_drift_count(
-                settings.upstream_server_id,
+                server_id,
                 tool_name,
                 settings.risk_drift_history_window_seconds,
             ),
+            suspicious_baseline=await self._detector.is_suspicious(server_id, tool_name),
         )
         factors = [factor for fn in FACTORS if (factor := fn(ctx)) is not None]
-        decay_raw = await self._redis.get(_decay_key(identity_id, tool_name))
-        return combine(factors, int(decay_raw or 0)), factors
+        decay_raw = await self._redis.get(_decay_key(identity_id, server_id, tool_name))
+        decay = min(int(decay_raw or 0), settings.risk_decay_max)
+        return combine(factors, decay), factors
 
-    async def _bump_frequency(self, identity_id: str, tool_name: str) -> int:
-        key = _freq_key(identity_id, tool_name)
+    async def _bump_frequency(self, identity_id: str, server_id: str, tool_name: str) -> int:
+        key = _freq_key(identity_id, server_id, tool_name)
         count: int = await self._redis.incr(key)
         if count == 1:
             await self._redis.expire(key, settings.risk_freq_window_seconds)
@@ -289,7 +317,10 @@ class RiskEngine:
         if count == 1:
             await self._redis.expire(key, settings.risk_denial_window_seconds)
 
-    async def apply_decay(self, identity_id: str, tool_name: str) -> None:
+    async def apply_decay(self, identity_id: str, server_id: str, tool_name: str) -> None:
         """One admin approval = one calibration step (§4.8): grow this pair's offset.
-        No TTL — calibration is meant to persist, unlike the rolling counters."""
-        await self._redis.incrby(_decay_key(identity_id, tool_name), settings.risk_decay_step)
+        The TTL refreshes on every approval (item 33) so active calibration persists
+        while idle calibration ages out; score() clamps the read to risk_decay_max."""
+        key = _decay_key(identity_id, server_id, tool_name)
+        await self._redis.incrby(key, settings.risk_decay_step)
+        await self._redis.expire(key, settings.risk_decay_ttl_seconds)

@@ -29,6 +29,7 @@ from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
+from services.gateway.step_up import ChallengeStore
 
 logger = structlog.get_logger(__name__)
 
@@ -60,6 +61,7 @@ class SessionManager:
         replay_guard: ReplayGuard,
         risk_engine: RiskEngine,
         approval_store: ApprovalStore,
+        challenge_store: ChallengeStore,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
@@ -69,21 +71,28 @@ class SessionManager:
         self._replay_guard = replay_guard
         self._risk_engine = risk_engine
         self._approval_store = approval_store
+        self._challenge_store = challenge_store
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    async def create(self, identity_id: str) -> Session:
-        if not settings.upstream_command:
-            raise RuntimeError("UPSTREAM_COMMAND is not configured")
+    async def create(self, identity_id: str, server_id: str) -> Session:
+        # Resolved against the live registry (item 35) — an id that vanished in a
+        # policy swap fails here, before anything is recorded or spawned.
+        command = self._policy_store.engine.server_command(server_id)
+        if command is None:
+            raise LookupError(f"unknown server {server_id!r}")
         session_id = uuid.uuid4().hex
         # No record, no session (§5): the SESSION_START row lands before anything spawns.
         await self._writer.write(
-            EventType.SESSION_START, identity_id, payload_extra={"session_id": session_id}
+            EventType.SESSION_START,
+            identity_id,
+            server_id=server_id,
+            payload_extra={"session_id": session_id},
         )
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
-        process = await upstream_client.spawn(settings.upstream_command)
+        process = await upstream_client.spawn(command)
 
         async def send_upstream(message: JSONRPCMessage) -> None:
             await upstream_client.write_message(process, message)
@@ -94,6 +103,7 @@ class SessionManager:
             process=process,
             interceptor=Interceptor(
                 identity_id=identity_id,
+                server_id=server_id,
                 session_id=session_id,
                 store=self._policy_store,
                 writer=self._writer,
@@ -102,6 +112,7 @@ class SessionManager:
                 replay=self._replay_guard,
                 risk=self._risk_engine,
                 approvals=self._approval_store,
+                challenges=self._challenge_store,
                 send_upstream=send_upstream,
             ),
         )

@@ -8,9 +8,13 @@ from pydantic import ValidationError
 from services.gateway import policy_engine
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 
+SERVERS = {"github": "unused-command", "filesystem": "unused-command"}
+
 
 def make_engine(identities: list[dict]) -> PolicyEngine:
-    return PolicyEngine(PolicyFile.model_validate({"version": 3, "identities": identities}))
+    return PolicyEngine(
+        PolicyFile.model_validate({"version": 3, "servers": SERVERS, "identities": identities})
+    )
 
 
 READONLY = {
@@ -110,6 +114,25 @@ identities:
         policy_engine.load(policy)
 
 
+# --- server registry validation (item 35) ---
+
+
+def test_grant_naming_unregistered_server_fails_load() -> None:
+    with pytest.raises(ValidationError, match="unregistered server"):
+        PolicyFile.model_validate({"version": 1, "servers": {}, "identities": [READONLY]})
+
+
+def test_wildcard_is_not_a_registrable_server_id() -> None:
+    with pytest.raises(ValidationError, match="not a registrable"):
+        PolicyFile.model_validate({"version": 1, "servers": {"*": "cmd"}, "identities": []})
+
+
+def test_server_command_resolves_registered_servers() -> None:
+    engine = make_engine([READONLY])
+    assert engine.server_command("github") == "unused-command"
+    assert engine.server_command("nope") is None
+
+
 def test_matching_grant_none_when_rbac_denies() -> None:
     engine = make_engine([READONLY])
     assert engine.matching_grant("agent-readonly", "github", "merge_pr") is None
@@ -163,3 +186,69 @@ identities:
     )
     assert store.reload() is False
     assert store.engine.version == 1
+
+
+# --- auth_mode field matrix (item 34) ---
+
+
+def signed_identity(**overrides: object) -> dict:
+    identity: dict = {
+        "id": "ci-agent",
+        "auth_mode": "signed",
+        "key_id": "kid_test",
+        "signing_secret_env": "POLICY_TEST_SECRET",
+        "allowed_servers": [],
+    }
+    identity.update(overrides)
+    return identity
+
+
+def test_signed_identity_loads_and_resolves_by_key_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLICY_TEST_SECRET", "s3cret")
+    engine = make_engine([signed_identity()])
+    assert engine.identity_for_key_id("kid_test") == "ci-agent"
+    identity = engine.identity("ci-agent")
+    assert identity is not None and identity.signing_secret == b"s3cret"
+
+
+def test_signed_identity_fails_load_without_its_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POLICY_TEST_SECRET", raising=False)
+    with pytest.raises(ValidationError, match="fail closed"):
+        make_engine([signed_identity()])
+
+
+def test_signed_identity_forbids_api_key_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLICY_TEST_SECRET", "s3cret")
+    with pytest.raises(ValidationError, match="forbids api_key_hash"):
+        make_engine([signed_identity(api_key_hash="sha256:2")])
+
+
+def test_signed_identity_cannot_be_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The /admin API authenticates by bearer key only; an unusable admin flag is a
+    # misconfiguration, rejected at load rather than left silently dead.
+    monkeypatch.setenv("POLICY_TEST_SECRET", "s3cret")
+    with pytest.raises(ValidationError, match="admin requires bearer"):
+        make_engine([signed_identity(admin=True)])
+
+
+def test_signed_identity_requires_key_id_and_env() -> None:
+    with pytest.raises(ValidationError, match="requires key_id"):
+        make_engine([signed_identity(key_id=None)])
+    with pytest.raises(ValidationError, match="requires key_id"):
+        make_engine([signed_identity(signing_secret_env=None)])
+
+
+def test_bearer_identity_requires_api_key_hash_and_forbids_signed_fields() -> None:
+    with pytest.raises(ValidationError, match="requires api_key_hash"):
+        make_engine([{"id": "a", "allowed_servers": []}])
+    with pytest.raises(ValidationError, match="signed-mode fields"):
+        make_engine([{"id": "a", "api_key_hash": "sha256:0", "key_id": "kid_x"}])
+
+
+def test_existing_bearer_yaml_shape_still_loads() -> None:
+    # No auth_mode key at all — the pre-item-34 shape must stay valid (default bearer).
+    engine = make_engine([READONLY])
+    identity = engine.identity("agent-readonly")
+    assert identity is not None and identity.auth_mode == "bearer"

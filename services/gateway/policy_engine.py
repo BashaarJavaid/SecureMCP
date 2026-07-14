@@ -11,6 +11,7 @@ startup — fail closed (ARCHITECTURE.md §5).
 """
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -18,7 +19,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
-from services.gateway import abac
+from services.gateway import abac, step_up
 
 logger = structlog.get_logger(__name__)
 
@@ -61,20 +62,109 @@ class Identity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    api_key_hash: str
+    # Auth posture (item 34). `bearer`: today's X-SecurMCP-Key header, looked up by
+    # api_key_hash. `signed`: no key on the wire — the request carries a non-secret
+    # key_id plus an HMAC in params._meta, verified with a secret resolved from the
+    # environment at load time (never stored in the policy file or its revision
+    # snapshots; see signing_secret_env).
+    auth_mode: Literal["bearer", "signed"] = "bearer"
+    api_key_hash: str | None = None
+    key_id: str | None = None
+    # Name of the env var holding the base64/raw shared secret — indirection keeps
+    # the YAML committable and revision snapshots secret-free.
+    signing_secret_env: str | None = None
+    # Step-up factor (item 37, either auth mode): name of the env var holding the
+    # base32 TOTP secret — the same indirection as signing_secret_env. Unset means
+    # the identity's CHALLENGE band stays a terminal error.
+    totp_secret_env: str | None = None
     # Grants access to /admin endpoints (drift re-approval, and Phase 3's admin API).
     admin: bool = False
     allowed_servers: list[ServerGrant] = []
     # identity.* attributes for ABAC conditions (identity.id comes from `id` itself).
     attributes: dict[str, str | int | float | bool] = {}
+    _signing_secret: bytes = PrivateAttr(default=b"")
+    _totp_secret: str = PrivateAttr(default="")
+
+    @model_validator(mode="after")
+    def _check_auth_fields(self) -> "Identity":
+        if self.auth_mode == "bearer":
+            if not self.api_key_hash:
+                raise ValueError(f"identity {self.id!r}: bearer auth_mode requires api_key_hash")
+            if self.key_id or self.signing_secret_env:
+                raise ValueError(
+                    f"identity {self.id!r}: key_id/signing_secret_env are signed-mode fields"
+                )
+        else:
+            if not self.key_id or not self.signing_secret_env:
+                raise ValueError(
+                    f"identity {self.id!r}: signed auth_mode requires key_id"
+                    " and signing_secret_env"
+                )
+            if self.api_key_hash:
+                raise ValueError(f"identity {self.id!r}: signed auth_mode forbids api_key_hash")
+            if self.admin:
+                # The /admin API authenticates by bearer key only; an admin that can
+                # never authenticate is a misconfiguration — fail at load (§5).
+                raise ValueError(f"identity {self.id!r}: admin requires bearer auth_mode")
+            secret = os.environ.get(self.signing_secret_env)
+            if not secret:
+                raise ValueError(
+                    f"identity {self.id!r}: env var {self.signing_secret_env!r} is unset"
+                    " — signed identities fail closed without their secret"
+                )
+            self._signing_secret = secret.encode()
+        if self.totp_secret_env:
+            totp_secret = os.environ.get(self.totp_secret_env)
+            if not totp_secret:
+                raise ValueError(
+                    f"identity {self.id!r}: env var {self.totp_secret_env!r} is unset"
+                    " — a step-up factor fails closed without its secret"
+                )
+            try:
+                step_up.decode_totp_secret(totp_secret)
+            except Exception as exc:
+                # A malformed secret fails load, not every redemption (§5).
+                raise ValueError(
+                    f"identity {self.id!r}: {self.totp_secret_env!r} is not a valid"
+                    " base32 TOTP secret"
+                ) from exc
+            self._totp_secret = totp_secret
+        return self
+
+    @property
+    def signing_secret(self) -> bytes:
+        return self._signing_secret
+
+    @property
+    def totp_secret(self) -> str:
+        return self._totp_secret
 
 
 class PolicyFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int
+    # Server registry (item 35): server_id -> stdio spawn command. Clients connect to
+    # /mcp/{server_id}; the command is part of enforcement state, so it lives in the
+    # policy file and is versioned/snapshotted/rolled back with it.
+    servers: dict[str, str] = {}
     identities: list[Identity] = []
     risk: RiskPolicy = RiskPolicy()
+
+    @model_validator(mode="after")
+    def _check_servers(self) -> "PolicyFile":
+        if "*" in self.servers:
+            raise ValueError('"*" is a grant wildcard, not a registrable server_id')
+        for identity in self.identities:
+            for grant in identity.allowed_servers:
+                if grant.server_id != "*" and grant.server_id not in self.servers:
+                    # A grant that can never match is an authoring mistake — fail at
+                    # load (§5), like abac's compile-time validation.
+                    raise ValueError(
+                        f"identity {identity.id!r}: grant references unregistered"
+                        f" server {grant.server_id!r}"
+                    )
+        return self
 
 
 class PolicyEngine:
@@ -85,7 +175,14 @@ class PolicyEngine:
         # re-serialized through yaml.dump, which would change formatting.
         self.raw = raw
         self._identities = {identity.id: identity for identity in policy.identities}
-        self._by_key_hash = {identity.api_key_hash: identity.id for identity in policy.identities}
+        self._by_key_hash = {
+            identity.api_key_hash: identity.id
+            for identity in policy.identities
+            if identity.api_key_hash
+        }
+        self._by_key_id = {
+            identity.key_id: identity.id for identity in policy.identities if identity.key_id
+        }
 
     @property
     def version(self) -> int:
@@ -94,12 +191,18 @@ class PolicyEngine:
     def identity_for_key_hash(self, key_hash: str) -> str | None:
         return self._by_key_hash.get(key_hash)
 
+    def identity_for_key_id(self, key_id: str) -> str | None:
+        return self._by_key_id.get(key_id)
+
     def is_admin(self, identity_id: str) -> bool:
         identity = self._identities.get(identity_id)
         return identity is not None and identity.admin
 
     def identity(self, identity_id: str) -> Identity | None:
         return self._identities.get(identity_id)
+
+    def server_command(self, server_id: str) -> str | None:
+        return self.policy.servers.get(server_id)
 
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:
         return self.matching_grant(identity_id, server_id, tool_name) is not None

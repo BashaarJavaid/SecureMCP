@@ -26,7 +26,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.gateway import signing
-from services.gateway.config import settings
 from services.gateway.db import AuditLog
 from services.gateway.decision import EventType
 from services.gateway.policy_engine import PolicyStore
@@ -41,6 +40,20 @@ def compute_hash(prev_hash: str, payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         prev_hash.encode() + canonicaljson.encode_canonical_json(payload)
     ).hexdigest()
+
+
+def _jsonb_safe(value: Any) -> Any:
+    """Postgres JSONB cannot store \\u0000 in strings, and deny rows persist raw
+    attacker arguments (item 21) — escape it so a null byte can't kill the write
+    and leave a terminal unaudited. Applied before hashing, so the chain covers
+    exactly what's stored."""
+    if isinstance(value, str):
+        return value.replace("\x00", "\\u0000")
+    if isinstance(value, dict):
+        return {_jsonb_safe(k): _jsonb_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonb_safe(v) for v in value]
+    return value
 
 
 class AuditWriter:
@@ -64,6 +77,7 @@ class AuditWriter:
         self,
         event_type: EventType,
         identity_id: str,
+        server_id: str | None = None,
         tool_name: str | None = None,
         payload_extra: dict[str, Any] | None = None,
         risk_score: int | None = None,
@@ -76,14 +90,16 @@ class AuditWriter:
                     try:
                         await pipe.watch(POINTER_KEY)
                         prev_hash = await self._prev_hash(pipe)
-                        payload: dict[str, Any] = {
-                            "event_type": event_type.value,
-                            "identity_id": identity_id,
-                            "server_id": settings.upstream_server_id,
-                            "tool_name": tool_name,
-                            "policy_version": self._policy_store.engine.version,
-                            **(payload_extra or {}),
-                        }
+                        payload: dict[str, Any] = _jsonb_safe(
+                            {
+                                "event_type": event_type.value,
+                                "identity_id": identity_id,
+                                "server_id": server_id,
+                                "tool_name": tool_name,
+                                "policy_version": self._policy_store.engine.version,
+                                **(payload_extra or {}),
+                            }
+                        )
                         curr_hash = compute_hash(prev_hash, payload)
                         seq = await self._insert(
                             prev_hash,
@@ -91,6 +107,7 @@ class AuditWriter:
                             payload,
                             event_type,
                             identity_id,
+                            server_id,
                             tool_name,
                             risk_score,
                         )
@@ -122,6 +139,7 @@ class AuditWriter:
         payload: dict[str, Any],
         event_type: EventType,
         identity_id: str,
+        server_id: str | None,
         tool_name: str | None,
         risk_score: int | None,
     ) -> int:
@@ -131,7 +149,7 @@ class AuditWriter:
                 curr_hash=curr_hash,
                 signature=signing.sign(self._signing_key, curr_hash),
                 identity_id=identity_id,
-                server_id=settings.upstream_server_id,
+                server_id=server_id,
                 tool_name=tool_name,
                 policy_version=self._policy_store.engine.version,
                 event_type=event_type.value,

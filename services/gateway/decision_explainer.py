@@ -26,7 +26,6 @@ from typing import Any
 import structlog
 
 from services.gateway import abac, param_validator
-from services.gateway.config import settings
 from services.gateway.db import AuditLog
 from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
 from services.gateway.drift_detector import DriftDetector
@@ -46,6 +45,7 @@ _OUTCOMES: dict[EventType, DecisionOutcome] = {
     EventType.DENY_RISK: DecisionOutcome.DENY,
     EventType.DENY_VALIDATION: DecisionOutcome.DENY,
     EventType.DENY_APPROVAL_MISMATCH: DecisionOutcome.DENY,
+    EventType.DENY_STEP_UP: DecisionOutcome.DENY,
     EventType.EXPIRED: DecisionOutcome.DENY,
     EventType.CHALLENGE: DecisionOutcome.CHALLENGE,
     EventType.HUMAN_APPROVAL_REQUIRED: DecisionOutcome.HUMAN_APPROVAL_REQUIRED,
@@ -128,6 +128,7 @@ def _context_hour(context: dict[str, Any]) -> int:
 async def explain_call(
     identity_id: str,
     tool_name: str,
+    server_id: str,
     arguments: dict[str, Any],
     context: dict[str, Any],
     *,
@@ -203,8 +204,6 @@ async def explain_call(
                 return condition, problem
         return None
 
-    server_id = settings.upstream_server_id
-
     # Stage 3: RBAC (stages 1-2, replay + auth, don't apply to a hypothetical call).
     grant = engine.matching_grant(identity_id, server_id, tool_name)
     if grant is None:
@@ -250,7 +249,7 @@ async def explain_call(
     # risk (§5). No approval-redemption branch — explain has no approval id.
     try:
         risk_score, risk_factors = await risk.score(
-            identity_id, tool_name, arguments, engine.policy.risk, dry_run=True
+            identity_id, server_id, tool_name, arguments, engine.policy.risk, dry_run=True
         )
     except Exception:
         logger.exception("risk_scoring_failed_fail_closed", tool=tool_name)
@@ -341,7 +340,7 @@ async def explain_call(
     if error is not None:
         return deny_validation(error)
 
-    # Stage 8: ALLOW — no sanitize/forward/audit on a dry run.
+    # Stage 8: ALLOW — no forward/audit on a dry run.
     return decide(
         DecisionOutcome.ALLOW,
         EventType.ALLOW,
