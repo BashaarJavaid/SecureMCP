@@ -9,6 +9,7 @@ Canonicalization is canonicaljson (pinned) — see the key-reordering smoke test
 """
 
 import hashlib
+import re
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.gateway import metrics
 from services.gateway.audit_log import AuditWriter
+from services.gateway.config import settings
 from services.gateway.db import AuditLog, ToolBaseline
 from services.gateway.decision import EventType
 
@@ -69,7 +71,9 @@ def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
     identical. Multiple changes report the maximum severity."""
     severities: list[DriftSeverity] = []
     if old.get("description") != new.get("description"):
-        severities.append(DriftSeverity.LOW)
+        # Item 36a: the description is the LLM attack surface — a change after human
+        # approval is the rug pull, so it blocks by default (config.py).
+        severities.append(DriftSeverity[settings.drift_description_severity.upper()])
 
     old_schema = old.get("inputSchema") or {}
     new_schema = new.get("inputSchema") or {}
@@ -97,6 +101,68 @@ def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
         # Changed in a way the table doesn't name — unclassifiable drift fails closed.
         return DriftSeverity.HIGH
     return None
+
+
+# Baseline-time content heuristics (item 36b). A pattern list is inherently
+# incomplete — novel phrasing evades it, and a protocol-layer gateway cannot
+# semantically evaluate intent — so a hit flags (risk factor + audit event),
+# it never blocks, and the miss case guarantees nothing.
+_SUSPICIOUS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(
+            r"\b(ignore|disregard|forget)\b.{0,40}\b(previous|prior|above|all)\b.{0,40}\binstructions\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "instruction-override phrasing",
+    ),
+    (
+        re.compile(
+            r"\byou are now\b|\bsystem prompt\b|\bdo not (tell|reveal|mention)\b", re.IGNORECASE
+        ),
+        "imperative text aimed at a model",
+    ),
+    (
+        re.compile(r"[​-‏⁠-⁤‪-‮﻿]"),
+        "hidden/zero-width or bidi-control unicode",
+    ),
+    (
+        re.compile(r"\b[A-Za-z0-9+/]{80,}={0,2}\b"),
+        "long base64-looking blob (possible encoded payload)",
+    ),
+]
+
+
+def scan_descriptions(tool: dict[str, Any]) -> list[str]:
+    """Heuristic findings for a tool definition's LLM-visible text: the top-level
+    description plus every nested `description` string inside inputSchema (property
+    descriptions are equally model-visible). Empty list = nothing matched, which is
+    NOT a clean bill of health — see _SUSPICIOUS_PATTERNS."""
+
+    def texts(value: Any, path: str) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        if isinstance(value, dict):
+            description = value.get("description")
+            if isinstance(description, str):
+                found.append((f"{path}.description", description))
+            for key, item in value.items():
+                if key != "description":
+                    found.extend(texts(item, f"{path}.{key}"))
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                found.extend(texts(item, f"{path}[{i}]"))
+        return found
+
+    candidates: list[tuple[str, str]] = []
+    description = tool.get("description")
+    if isinstance(description, str):
+        candidates.append(("description", description))
+    candidates.extend(texts(tool.get("inputSchema"), "inputSchema"))
+    return [
+        f"{label} in {path}"
+        for path, text in candidates
+        for pattern, label in _SUSPICIOUS_PATTERNS
+        if pattern.search(text)
+    ]
 
 
 class DriftDetector:
@@ -185,6 +251,18 @@ class DriftDetector:
         identity_id: str,
     ) -> None:
         live_hash = tool_hash(tool)
+        # Item 36b: a poisoned first contact must not become a *silent* trust anchor
+        # — the schema is still baselined (flag, not block), but the finding is
+        # audited and feeds the suspicious_baseline risk factor.
+        findings = scan_descriptions(tool)
+        if findings:
+            await self._writer.write(
+                EventType.BASELINE_FLAGGED,
+                identity_id,
+                server_id=server_id,
+                tool_name=name,
+                payload_extra={"findings": findings},
+            )
         source = next(
             (
                 row
@@ -201,6 +279,7 @@ class DriftDetector:
                     tool_name=name,
                     approved_schema=tool,
                     approved_hash=live_hash,
+                    suspicious=bool(findings),
                 )
             )
             return
@@ -228,6 +307,7 @@ class DriftDetector:
                 blocked=True,
                 observed_schema=tool,
                 observed_hash=live_hash,
+                suspicious=bool(findings),
             )
         )
 
@@ -274,6 +354,19 @@ class DriftDetector:
             )
             return bool(result.scalar_one_or_none())
 
+    async def is_suspicious(self, server_id: str, tool_name: str) -> bool:
+        """Whether the tool's *approved* baseline matched the item-36b content
+        heuristics — the Risk Engine's suspicious_baseline signal. A flag, never a
+        block; cleared only when re-approval promotes content that scans clean."""
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(ToolBaseline.suspicious).where(
+                    ToolBaseline.server_id == server_id,
+                    ToolBaseline.tool_name == tool_name,
+                )
+            )
+            return bool(result.scalar_one_or_none())
+
     async def approve(self, server_id: str, tool_name: str, approved_by: str) -> int:
         """Promote the observed schema to the accepted baseline (admin action).
         Returns the APPROVED audit row's seq. Raises LookupError if there is no
@@ -294,6 +387,18 @@ class DriftDetector:
             row.observed_schema = None
             row.observed_hash = None
             row.blocked = False
+            # Item 36b: the flag tracks the *current* approved content — rescan on
+            # promotion, and audit the finding when a clean baseline turns suspicious.
+            findings = scan_descriptions(row.approved_schema)
+            if findings and not row.suspicious:
+                await self._writer.write(
+                    EventType.BASELINE_FLAGGED,
+                    approved_by,
+                    server_id=server_id,
+                    tool_name=tool_name,
+                    payload_extra={"findings": findings},
+                )
+            row.suspicious = bool(findings)
             seq = await self._writer.write(
                 EventType.APPROVED,
                 approved_by,

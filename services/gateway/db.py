@@ -69,6 +69,9 @@ class ToolBaseline(Base):
     blocked: Mapped[bool] = mapped_column(default=False)
     observed_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     observed_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    # Item 36b: the approved content matched the description heuristics — feeds the
+    # suspicious_baseline risk factor; a flag, never a block.
+    suspicious: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
 
 class Approval(Base):

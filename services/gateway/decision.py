@@ -25,6 +25,9 @@ class EventType(StrEnum):
     DRIFT_MEDIUM = "DRIFT_MEDIUM"
     DRIFT_HIGH = "DRIFT_HIGH"
     DRIFT_CRITICAL = "DRIFT_CRITICAL"
+    # Item 36b: a newly baselined/promoted schema matched the description-content
+    # heuristics — flagged (risk factor), never blocked. Non-decision row.
+    BASELINE_FLAGGED = "BASELINE_FLAGGED"
     POLICY_ACTIVATED = "POLICY_ACTIVATED"
     POLICY_ERROR = "POLICY_ERROR"
 

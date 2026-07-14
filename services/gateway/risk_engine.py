@@ -48,6 +48,7 @@ DRIFT_IN_REVIEW_CONTRIBUTION = 15
 PRIOR_DENIAL_CONTRIBUTION = 25
 AUTH_FAILURE_CONTRIBUTION = 20
 DRIFT_HISTORY_CONTRIBUTION = 15
+SUSPICIOUS_BASELINE_CONTRIBUTION = 20
 
 # Factors risk decay may discount — §4.8 names them exactly: call frequency,
 # prior-denial-rate, drift-in-review; never the tier, and deliberately not
@@ -68,6 +69,7 @@ class RiskContext:
     denial_count: int  # DENY_* terminals for this identity in the rolling window
     auth_failure_count: int  # gateway-wide failed key lookups in the rolling window
     drift_event_count: int  # DRIFT_* audit events for this tool in the rolling window
+    suspicious_baseline: bool  # approved content matched the item-36b heuristics
 
 
 def _string_values(value: Any) -> Iterator[str]:
@@ -183,6 +185,21 @@ def _drift_history(ctx: RiskContext) -> RiskFactor | None:
     )
 
 
+def _suspicious_baseline(ctx: RiskContext) -> RiskFactor | None:
+    # Item 36b: a property of the tool's approved content, like the sensitivity
+    # tier — deliberately not in BEHAVIORAL_FACTORS, so approvals can't decay it.
+    if not ctx.suspicious_baseline:
+        return None
+    return RiskFactor(
+        factor="suspicious_baseline",
+        contribution=SUSPICIOUS_BASELINE_CONTRIBUTION,
+        reason=(
+            f"{ctx.tool_name!r}'s approved description matched instruction-injection"
+            " heuristics when it was baselined"
+        ),
+    )
+
+
 FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _tool_sensitivity,
     _blast_radius,
@@ -192,6 +209,7 @@ FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _prior_denial_rate,
     _auth_failures,
     _drift_history,
+    _suspicious_baseline,
 ]
 
 
@@ -273,6 +291,7 @@ class RiskEngine:
                 tool_name,
                 settings.risk_drift_history_window_seconds,
             ),
+            suspicious_baseline=await self._detector.is_suspicious(server_id, tool_name),
         )
         factors = [factor for fn in FACTORS if (factor := fn(ctx)) is not None]
         decay_raw = await self._redis.get(_decay_key(identity_id, server_id, tool_name))

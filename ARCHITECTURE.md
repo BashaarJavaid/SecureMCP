@@ -311,7 +311,7 @@ Conditions are parsed once at policy load into a small AST (a hand-rolled boolea
 
 | Drift type | Severity | Default action |
 |---|---|---|
-| `description` text changed only | Low | Log `DRIFT_LOW`, allow calls, flag for review |
+| `description` text changed only | High (default; `DRIFT_DESCRIPTION_SEVERITY`) | Log `DRIFT_HIGH`, block calls until re-approval — the description is the LLM attack surface, so a change after human approval is precisely the rug pull (item 36a); `low` restores the old log-only posture |
 | Optional parameter added | Medium | Log `DRIFT_MEDIUM`, allow calls, flag for review |
 | Tool removed entirely (no longer in `tools/list`) | Medium | Log `DRIFT_MEDIUM`, no action needed (tool can't be called), flag for review in case it reappears |
 | Parameter removed | High | Log `DRIFT_HIGH`, block calls until re-approval |
@@ -334,6 +334,7 @@ Rather than one monolithic scoring function, each signal is implemented as a sma
 - **Prior denial rate** for this identity over a rolling window — an identity that's been denied repeatedly is a stronger risk signal than one with a clean history
 - **Recent schema drift history** for the target tool, even if already re-approved — a tool that changed shape twice in the last week is inherently riskier than one that's been stable for months
 - **Recent authentication failures** for this identity (a small addition to the Auth Layer: one Redis counter incremented on failed API-key lookups, decayed over a rolling window) — a spike in auth failures just before a successful call is a classic credential-stuffing pattern
+- **Suspicious baseline** (item 36b): the tool's *approved* description text matched the baseline-time content heuristics (instruction-override phrasing, hidden/zero-width unicode, encoded payloads) — a static property of the tool's content, non-decayable like the sensitivity tier, and honest about being a heuristic: it informs risk, it never blocks
 
 **Determinism is a deliberate design choice, not a placeholder for a future ML model.** This project's value proposition is security, determinism, and explainability — a learned model scoring risk would work against all three: it introduces training-data provenance questions, validation burden, and a decision that can't be fully explained by the Decision Explanation feature below. A weighted, rule-based engine isn't a lesser version of a "real" risk engine here — for this problem, it's the correct architecture, and no ML-based scoring is planned.
 

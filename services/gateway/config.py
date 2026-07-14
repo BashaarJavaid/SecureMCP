@@ -1,5 +1,7 @@
 """Environment-driven settings for the gateway."""
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 
 
@@ -44,6 +46,11 @@ class Settings(BaseSettings):
     # the window, even if re-approved ("changed shape twice in the last week").
     risk_drift_history_window_seconds: int = 604800
     risk_drift_history_threshold: int = 2
+    # Severity of a description-only change (item 36a). The description is the LLM
+    # attack surface, so a change after human approval blocks by default (>= high
+    # blocks until re-approval); "low" restores the old log-only posture. An invalid
+    # value fails startup — fail closed on authoring mistakes (§5).
+    drift_description_severity: Literal["low", "medium", "high", "critical"] = "high"
     # Human approval lifecycle (§4.8): pending approvals expire after this TTL.
     approval_ttl_seconds: int = 900
     # Prometheus scrape port (§7, item 25) — a separate internal-only listener,

@@ -1,6 +1,7 @@
 """ARCHITECTURE.md §11: simulate a rug pull at each severity tier and assert the
-classification AND the action — description-only must not block, required-change must,
-a rename is treated as a new unapproved tool. Plus the re-approval flow."""
+classification AND the action — description-only blocks by default (item 36a, and the
+knob loosens it back to log-only), required-change blocks, a rename is treated as a
+new unapproved tool. Plus the re-approval flow."""
 
 import httpx
 import pytest
@@ -8,6 +9,7 @@ from mcp import McpError
 from mcp.types import TextContent
 from sqlalchemy import select
 
+from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
 from tests.adversarial.conftest import Gateway, set_mutation
 from tests.integration.test_policy_scoping import connect
@@ -31,20 +33,35 @@ async def baseline(gateway: Gateway) -> None:
         await session.list_tools()
 
 
-async def test_description_only_drift_is_logged_low_and_allowed(
-    drift_gateway: Gateway,
+async def test_description_only_drift_blocks_by_default(drift_gateway: Gateway) -> None:
+    # Item 36a: a description changed after human approval is the rug pull —
+    # High by default, so the call is DENY_DRIFT until re-approval.
+    await baseline(drift_gateway)
+    set_mutation("description")
+    async with connect(drift_gateway.url, drift_gateway.keys["dev"]) as session:
+        await session.list_tools()
+        with pytest.raises(McpError) as excinfo:
+            await session.call_tool("send_email", {"to": "a@b.c", "subject": "hi"})
+        assert excinfo.value.error.data["event_type"] == "DENY_DRIFT"
+
+        # Same drift again in the same shape: logged once, not per poll.
+        await session.list_tools()
+    events = await drift_events()
+    assert events == ["DRIFT_HIGH"]
+
+
+async def test_description_drift_severity_is_configurable(
+    drift_gateway: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The knob loosens too: "low" restores the pre-item-36 log-only posture.
+    monkeypatch.setattr(settings, "drift_description_severity", "low")
     await baseline(drift_gateway)
     set_mutation("description")
     async with connect(drift_gateway.url, drift_gateway.keys["dev"]) as session:
         await session.list_tools()
         result = await session.call_tool("send_email", {"to": "a@b.c", "subject": "hi"})
         assert isinstance(result.content[0], TextContent)  # still allowed
-
-        # Same drift again in the same shape: logged once, not per poll.
-        await session.list_tools()
-    events = await drift_events()
-    assert events == ["DRIFT_LOW"]
+    assert await drift_events() == ["DRIFT_LOW"]
 
 
 async def test_optional_param_drift_is_logged_medium_and_allowed(

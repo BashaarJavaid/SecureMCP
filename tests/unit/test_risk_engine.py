@@ -43,6 +43,7 @@ def ctx(**overrides: Any) -> RiskContext:
         "denial_count": 0,
         "auth_failure_count": 0,
         "drift_event_count": 0,
+        "suspicious_baseline": False,
     }
     return RiskContext(**{**defaults, **overrides})
 
