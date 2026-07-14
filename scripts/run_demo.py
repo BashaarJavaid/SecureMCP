@@ -48,10 +48,10 @@ import yaml  # noqa: E402
 from mcp import ClientSession, McpError  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 from mcp.types import LATEST_PROTOCOL_VERSION  # noqa: E402
-from sqlalchemy import select, text  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
+from scripts import reset_dev_state as dev_state  # noqa: E402
 from services.gateway import auth  # noqa: E402
-from services.gateway.audit_log import POINTER_KEY  # noqa: E402
 from services.gateway.config import settings  # noqa: E402
 from services.gateway.db import AuditLog, async_session, engine  # noqa: E402
 from services.gateway.replay_guard import (  # noqa: E402
@@ -190,30 +190,16 @@ async def clear_risk_counters() -> None:
 
 
 async def reset_dev_state() -> None:
-    """Fresh slate for a repeatable recording: dev-only wipe of the audit chain,
-    drift baselines, risk counters, and cached pointers — same reset the integration
-    suite uses. A leftover baseline from a prior run would make the benign schema
-    itself register as drift."""
-    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
+    """Fresh slate for a repeatable recording: the shared item-38 dev reset —
+    audit chain, drift baselines, approvals, risk counters, cached pointers, and
+    stale revision snapshots (each demo run re-mints keys into the same policy
+    version number, which would collide with item 19's append-only check). A
+    leftover baseline from a prior run would make the benign schema itself
+    register as drift."""
     try:
-        await redis_client.delete(POINTER_KEY, "schema:default")
-    except Exception:
-        sys.exit("redis not reachable — run: docker compose up -d redis")
-    finally:
-        await redis_client.aclose()
-    await clear_risk_counters()
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
-            await conn.execute(text("TRUNCATE tool_baselines"))
-            await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
-            await conn.execute(text("TRUNCATE policy_versions"))
-    except Exception:
-        sys.exit("postgres not reachable — run: docker compose up -d postgres")
-    # Each demo run re-mints keys into the same policy version number; stale revision
-    # snapshots would collide with the fresh content (item 19's append-only check).
-    for snapshot in Path(settings.policy_revisions_dir).glob("v*.yaml"):
-        snapshot.unlink()
+        await dev_state.reset_dev_state(clear_snapshots=True)
+    except dev_state.ResetError as exc:
+        sys.exit(str(exc))
 
 
 @asynccontextmanager

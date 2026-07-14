@@ -71,6 +71,24 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
         logger.exception("audit_write_failed", event_type="POLICY_ACTIVATED")
 
 
+async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None:
+    """Boot-time activation record (item 19). A conflict here is almost always
+    leftover dev/demo state hitting the fail-closed monotonicity check — a good
+    security property with a terrible first-run experience (item 38). Startup
+    still fails, but with the remedy in the message; SIGHUP and rollback conflicts
+    keep their own handling, where a state wipe would be the wrong advice."""
+    try:
+        await policy_versions.record_activation(engine, "startup", async_session)
+    except policy_versions.ActivationError as exc:
+        hint = (
+            f"{exc} — leftover dev/demo state? reset with:"
+            " python scripts/reset_dev_state.py (in docker:"
+            " docker compose run --rm gateway python scripts/reset_dev_state.py --yes)"
+        )
+        logger.error("policy_activation_conflict_at_startup", detail=hint)
+        raise policy_versions.ActivationError(hint) from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
@@ -86,7 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (e.g. same version, different content) fails startup; the snapshot/row are
     # idempotent on a re-seen version but the audit row is unconditional, so every
     # boot's active policy — including one reverting a rollback — is in the chain.
-    await policy_versions.record_activation(store.engine, "startup", async_session)
+    await _record_startup_activation(store.engine)
     await writer.write(
         EventType.POLICY_ACTIVATED,
         "startup",

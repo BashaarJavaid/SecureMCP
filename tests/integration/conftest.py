@@ -12,19 +12,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import redis.asyncio as aioredis
 import uvicorn
 import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from mcp import ClientSession
 from mcp.types import NotificationParams, PaginatedRequestParams, RequestParams
-from sqlalchemy import text
 
+from scripts.reset_dev_state import ResetError, reset_dev_state
 from services.gateway import auth
-from services.gateway.audit_log import POINTER_KEY
 from services.gateway.config import settings
-from services.gateway.db import Base, engine
+from services.gateway.db import engine
 from services.gateway.main import app
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
@@ -81,33 +79,14 @@ class SignedSession(ClientSession):
 @pytest.fixture
 async def clean_audit() -> None:
     """Skip unless postgres + redis are reachable; start each test from an empty,
-    consistent chain (empty audit_log AND no stale latest_audit_hash pointer)."""
-    redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    try:
-        await redis_client.ping()
-        await redis_client.delete(POINTER_KEY)
-        # Any server's cached schema (item 35: the multi-server test registers
-        # non-default ids), plus the risk counters and step-up challenge state.
-        for pattern in ("schema:*", "risk:*", "challenge:*"):
-            keys = await redis_client.keys(pattern)
-            if keys:
-                await redis_client.delete(*keys)
-    except Exception:
-        pytest.skip("redis not reachable — run: docker compose up -d redis")
-    finally:
-        await redis_client.aclose()
+    consistent chain via the shared item-38 reset. Snapshots stay untouched — the
+    per-test revisions dir is only patched in later, by running_gateway."""
     # Each test runs in a fresh event loop; drop connections pooled under the old one.
     await engine.dispose()
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text("TRUNCATE audit_log RESTART IDENTITY"))
-            await conn.execute(text("TRUNCATE tool_baselines"))
-            await conn.execute(text("TRUNCATE audit_verifier_checkpoint"))
-            await conn.execute(text("TRUNCATE approvals"))
-            await conn.execute(text("TRUNCATE policy_versions"))
-    except Exception:
-        pytest.skip("postgres not reachable — run: docker compose up -d postgres")
+        await reset_dev_state(clear_snapshots=False)
+    except ResetError as exc:
+        pytest.skip(str(exc))
 
 
 @dataclass
