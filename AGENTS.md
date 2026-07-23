@@ -1,13 +1,10 @@
----
-description: SecurMCP project context and behavioral guidelines — always applied
-alwaysApply: true
----
+# AGENTS.md
 
-# SecurMCP — Project Rules
-
-Project-specific context and instructions for SecurMCP, merged with a set of general behavioral guidelines (below) aimed at reducing common LLM coding mistakes: unstated assumptions, speculative complexity, unrelated edits, and vague success criteria. Adapted from [andrej-karpathy-skills/CLAUDE.md](https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md) for parity with this repo's `CLAUDE.md` (used when this project is opened in Claude Code instead of Cursor).
+Project-specific context and instructions for SecurMCP, merged with a set of general behavioral guidelines (sections 1-4 below, adapted from [andrej-karpathy-skills/CLAUDE.md](https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md)) aimed at reducing common LLM coding mistakes: unstated assumptions, speculative complexity, unrelated edits, and vague success criteria.
 
 **Tradeoff:** these guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+---
 
 ## Project
 
@@ -16,16 +13,16 @@ SecurMCP — a zero-trust, risk-aware gateway proxy for the Model Context Protoc
 ## Where things live
 
 - `README.md` — what this is, tech stack, repo layout, demo script. Read this first.
-- `ARCHITECTURE.md` — the decision pipeline, every component in depth, failure modes, hardening, observability, benchmarks, testing, CI/CD, deployment. Pull in with `@ARCHITECTURE.md` when working on core gateway logic — don't rely on this always being loaded.
-- `THREAT_MODEL.md` — what's protected against, what isn't, and the assumptions the design rests on. Pull in with `@THREAT_MODEL.md` for anything security-relevant (policy engine, risk engine, auth, audit log).
-- `docs/adr/` — one file per architecture decision. Pull in the specific ADR relevant to the component being touched (e.g. `@docs/adr/ADR-004-no-opa-for-v1.md`), not all of them by default.
-- `ROADMAP.md` — the four-phase build order as a living checklist. Check with `@ROADMAP.md` at the start of a session to see what's next; update it as items complete.
+- `ARCHITECTURE.md` — the decision pipeline, every component in depth, failure modes, hardening, observability, benchmarks, testing, CI/CD, deployment. Load this when working on core gateway logic.
+- `THREAT_MODEL.md` — what's protected against, what isn't, and the assumptions the design rests on. Load this when working on anything security-relevant (policy engine, risk engine, auth, audit log).
+- `docs/adr/` — one file per architecture decision, including why several common alternatives weren't chosen. Load the specific ADR relevant to the component being touched, not all of them by default.
+- `ROADMAP.md` — the four-phase build order as a living checklist. Check this at the start of a session to see what's next; update it as items complete.
 
-This rule file (`index.mdc`) is the only thing that loads automatically on every request — everything else above should be pulled in explicitly via `@file` mentions per task, not assumed to be in context.
+Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelated tasks (e.g. a pure frontend/demo-recording tweak) — pull in only the file relevant to the current task.
 
 ## Keeping the instruction files in sync
 
-This project ships the same guidance in three tool-specific forms: `CLAUDE.md` (Claude Code), `AGENTS.md` (Codex), and this Cursor rule (`.cursor/rules/securmcp.mdc`). They are **not** auto-generated — keep them at parity by hand. Whenever you change any one of them — Commands, Current phase, Conventions, or any substantive guidance — mirror the change into the other two in the **same commit**, regardless of which tool you're working in. `CLAUDE.md` and `AGENTS.md` are near-identical (only the top `#` heading differs); this rule carries the same content in Cursor's form (frontmatter, `@file` mentions), so port the substance, not the formatting.
+This project ships the same guidance in three tool-specific forms: `CLAUDE.md` (Claude Code), `AGENTS.md` (Codex), and `.cursor/rules/securmcp.mdc` (Cursor). They are **not** auto-generated — keep them at parity by hand. Whenever you change any one of them — Commands, Current phase, Conventions, or any substantive guidance — mirror the change into the other two in the **same commit**, regardless of which tool you're working in. `CLAUDE.md` and `AGENTS.md` are near-identical (only the top `#` heading differs), so that edit is a straight copy; the Cursor rule carries the same content in its own form (frontmatter, `@file` mentions), so port the substance, not the formatting.
 
 ## Conventions
 

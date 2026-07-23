@@ -20,6 +20,10 @@ SecurMCP — a zero-trust, risk-aware gateway proxy for the Model Context Protoc
 
 Don't load `ARCHITECTURE.md`, `THREAT_MODEL.md`, or the ADRs in full for unrelated tasks (e.g. a pure frontend/demo-recording tweak) — pull in only the file relevant to the current task.
 
+## Keeping the instruction files in sync
+
+This project ships the same guidance in three tool-specific forms: `CLAUDE.md` (Claude Code), `AGENTS.md` (Codex), and `.cursor/rules/securmcp.mdc` (Cursor). They are **not** auto-generated — keep them at parity by hand. Whenever you change any one of them — Commands, Current phase, Conventions, or any substantive guidance — mirror the change into the other two in the **same commit**, regardless of which tool you're working in. `CLAUDE.md` and `AGENTS.md` are near-identical (only the top `#` heading differs), so that edit is a straight copy; the Cursor rule carries the same content in its own form (frontmatter, `@file` mentions), so port the substance, not the formatting.
+
 ## Conventions
 
 - Python 3.12, FastAPI, async throughout. No `localStorage`/browser-storage patterns apply here (backend service).
