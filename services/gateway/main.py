@@ -41,7 +41,7 @@ from services.gateway.step_up import ChallengeStore
 logging_config.configure()
 logger = structlog.get_logger(__name__)
 
-KEY_HEADER = "x-securmcp-key"
+KEY_HEADER = "x-portunusmcp-key"
 
 
 async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
@@ -155,7 +155,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await redis_client.aclose()
 
 
-app = FastAPI(title="SecurMCP Gateway", lifespan=lifespan)
+app = FastAPI(title="PortunusMCP Gateway", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -194,7 +194,7 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
 @app.post("/admin/approvals/{approval_id}/approve")
 async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
     """Human approval grant (§4.8, item 16): flips a pending approval to approved so
-    the client's retry (params._meta["securmcp/approval_id"]) can redeem it once.
+    the client's retry (params._meta["portunusmcp/approval_id"]) can redeem it once.
     Also applies one risk-decay step for the (identity, tool) pair — a human judged
     this high-risk call fine, and that calibrates future behavioral scoring."""
     store: PolicyStore = request.app.state.policy_store

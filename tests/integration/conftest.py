@@ -28,7 +28,7 @@ from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
 ECHO_SERVER = Path(__file__).parent / "fixtures" / "echo_server.py"
 
-SIGNED_SECRET_ENV = "SECURMCP_TEST_SIGNING_SECRET"
+SIGNED_SECRET_ENV = "PORTUNUSMCP_TEST_SIGNING_SECRET"
 
 
 class SignedSession(ClientSession):

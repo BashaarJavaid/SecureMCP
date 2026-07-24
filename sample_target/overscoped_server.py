@@ -1,7 +1,7 @@
 """Deliberately overscoped demo MCP server (README, Demo Target section).
 
 Exposes safe and destructive tools side by side with no internal authz — any client
-that can reach it sees and can call everything. That's the gap SecurMCP's schema
+that can reach it sees and can call everything. That's the gap PortunusMCP's schema
 pruning + point-of-action RBAC closes. Every tool is a side-effect-free fake.
 """
 

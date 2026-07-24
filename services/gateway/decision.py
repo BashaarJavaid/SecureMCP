@@ -60,11 +60,11 @@ class Decision(BaseModel):
     # None until the audit log writer lands (Phase 1, item 5).
     audit_id: str | None = None
     # Set only on HUMAN_APPROVAL_REQUIRED: the id the client passes back via
-    # params._meta["securmcp/approval_id"] on the approved retry (§4.8).
+    # params._meta["portunusmcp/approval_id"] on the approved retry (§4.8).
     approval_id: str | None = None
     # Set only on an answerable CHALLENGE (item 37 — the identity has a TOTP
     # factor): the one-time id the client passes back via
-    # params._meta["securmcp/challenge_id"] alongside a fresh TOTP code.
+    # params._meta["portunusmcp/challenge_id"] alongside a fresh TOTP code.
     challenge_id: str | None = None
     # Decision Explanation only (§4.8, item 20): the outcome the 40/70/90 threshold
     # mapping gives for risk_score, set when that differs from the actual outcome

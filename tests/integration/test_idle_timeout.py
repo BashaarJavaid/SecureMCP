@@ -23,7 +23,7 @@ async def test_idle_session_is_torn_down(gateway: Gateway) -> None:
         # so observations are captured inside and asserted outside.
         try:
             async with httpx.AsyncClient(
-                headers={"X-SecurMCP-Key": gateway.keys["agent-full"]}, follow_redirects=True
+                headers={"X-PortunusMCP-Key": gateway.keys["agent-full"]}, follow_redirects=True
             ) as http_client:
                 async with streamable_http_client(
                     f"{gateway.url}/mcp/default", http_client=http_client

@@ -1,1 +1,1 @@
-"""SecurMCP gateway."""
+"""PortunusMCP gateway."""

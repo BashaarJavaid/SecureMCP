@@ -1,7 +1,7 @@
 """Replay Guard (ARCHITECTURE.md §4.8): nonce + timestamp window dedup via Redis.
 
 The pair travels as a client-generated UUID nonce and a Unix-epoch-seconds timestamp
-in `params._meta` under the keys `securmcp/nonce` and `securmcp/timestamp` (MCP
+in `params._meta` under the keys `portunusmcp/nonce` and `portunusmcp/timestamp` (MCP
 reserves `_meta` for exactly this kind of out-of-band metadata; top-level params
 would collide with the typed CallToolRequestParams shape). Whether it is required is
 the identity's auth_mode (item 34): mandatory for `signed` identities, where the pair
@@ -18,8 +18,8 @@ import uuid
 
 import redis.asyncio as aioredis
 
-NONCE_META_KEY = "securmcp/nonce"
-TIMESTAMP_META_KEY = "securmcp/timestamp"
+NONCE_META_KEY = "portunusmcp/nonce"
+TIMESTAMP_META_KEY = "portunusmcp/timestamp"
 
 
 def _nonce_key(nonce: str) -> str:

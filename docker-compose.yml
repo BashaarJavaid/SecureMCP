@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-securmcp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securmcp}
-      POSTGRES_DB: ${POSTGRES_DB:-securmcp}
+      POSTGRES_USER: ${POSTGRES_USER:-portunusmcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-portunusmcp}
+      POSTGRES_DB: ${POSTGRES_DB:-portunusmcp}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-securmcp} -d ${POSTGRES_DB:-securmcp}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-portunusmcp} -d ${POSTGRES_DB:-portunusmcp}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -28,20 +28,20 @@ services:
   gateway:
     build: .
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       # Upstream stdio commands live in the policy's `servers:` block (item 35),
       # spawned per session inside this container.
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
       # Signed-identity secret for the demo policy's ci-agent (item 34): the YAML
       # names this var; the value never enters the policy file or the repo.
-      SECURMCP_DEMO_SIGNING_SECRET: ${SECURMCP_DEMO_SIGNING_SECRET:-}
+      PORTUNUSMCP_DEMO_SIGNING_SECRET: ${PORTUNUSMCP_DEMO_SIGNING_SECRET:-}
       # Metrics default to loopback (config.py) so a bare-host run doesn't expose
       # identity ids / tool names. Here the port is unpublished, so the compose
       # network is the boundary and Prometheus needs to reach it.
       METRICS_HOST: "0.0.0.0"
     volumes:
-      # Host-editable policies: edit + `docker kill -s HUP securemcp-gateway-1` to reload.
+      # Host-editable policies: edit + `docker kill -s HUP portunusmcp-gateway-1` to reload.
       # Read-only so a compromised gateway can't persist a policy backdoor; only the
       # revisions submount is writable, for activation snapshots (item 19).
       - ./policies:/app/policies:ro
@@ -64,7 +64,7 @@ services:
     build: .
     command: python scripts/audit_verifier_daemon.py
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://securmcp:securmcp@postgres:5432/securmcp}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS:-60}
       METRICS_PORT: "9101"
       METRICS_HOST: "0.0.0.0"

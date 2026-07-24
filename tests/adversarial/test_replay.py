@@ -65,7 +65,7 @@ async def test_malformed_nonce_fails_closed(gateway: Gateway) -> None:
 
 
 async def test_stock_client_without_meta_completes_tools_call(gateway: Gateway) -> None:
-    # Item 34 verify: a stock SDK client sending no securmcp _meta at all makes a
+    # Item 34 verify: a stock SDK client sending no portunusmcp _meta at all makes a
     # successful tools/call under bearer — the client-compatibility half of the item.
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
         result = await session.call_tool("echo", {"text": "no meta"})

@@ -128,7 +128,7 @@ async def test_rollback_reactivates_prior_revision(versioned_gateway: Gateway) -
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{versioned_gateway.url}/admin/policy/rollback/1",
-                headers={"X-SecurMCP-Key": keys["ops-admin"]},
+                headers={"X-PortunusMCP-Key": keys["ops-admin"]},
             )
         assert response.status_code == 200
         decision = response.json()
@@ -152,11 +152,11 @@ async def test_rollback_authz_and_missing_version(versioned_gateway: Gateway) ->
     async with httpx.AsyncClient() as client:
         assert (await client.post(url)).status_code == 401
         response = await client.post(
-            url, headers={"X-SecurMCP-Key": versioned_gateway.keys["agent"]}
+            url, headers={"X-PortunusMCP-Key": versioned_gateway.keys["agent"]}
         )
         assert response.status_code == 403
         response = await client.post(
             f"{versioned_gateway.url}/admin/policy/rollback/99",
-            headers={"X-SecurMCP-Key": versioned_gateway.keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": versioned_gateway.keys["ops-admin"]},
         )
         assert response.status_code == 404

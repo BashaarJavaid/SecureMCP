@@ -1,5 +1,5 @@
 [project]
-name = "securmcp"
+name = "portunusmcp"
 version = "0.1.0"
 description = "Zero-trust, risk-aware gateway proxy for the Model Context Protocol"
 requires-python = ">=3.12"

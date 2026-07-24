@@ -125,7 +125,7 @@ async def test_full_rogue_demo_arc(rogue_gateway: Gateway, tmp_path: Path) -> No
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{rogue_gateway.url}/admin/tools/default/send_email/approve",
-                    headers={"X-SecurMCP-Key": rogue_gateway.keys["ops-admin"]},
+                    headers={"X-PortunusMCP-Key": rogue_gateway.keys["ops-admin"]},
                 )
             assert response.status_code == 200
             assert response.json()["event_type"] == "APPROVED"

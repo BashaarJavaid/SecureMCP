@@ -23,7 +23,7 @@ from tests.integration.conftest import Gateway, _key_hash, running_gateway
 @asynccontextmanager
 async def connect_to(url: str, server_id: str, api_key: str) -> AsyncIterator[ClientSession]:
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
+        headers={"X-PortunusMCP-Key": api_key}, follow_redirects=True
     ) as http_client:
         async with streamable_http_client(f"{url}/mcp/{server_id}", http_client=http_client) as (
             read,
@@ -83,7 +83,7 @@ async def test_rbac_is_isolated_per_server(multi_gateway: Gateway) -> None:
 
 
 async def test_unregistered_server_id_is_404(multi_gateway: Gateway) -> None:
-    async with httpx.AsyncClient(headers={"X-SecurMCP-Key": multi_gateway.keys["full"]}) as client:
+    async with httpx.AsyncClient(headers={"X-PortunusMCP-Key": multi_gateway.keys["full"]}) as client:
         response = await client.post(f"{multi_gateway.url}/mcp/gamma", json={})
         assert response.status_code == 404
 

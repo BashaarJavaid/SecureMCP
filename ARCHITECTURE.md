@@ -1,6 +1,6 @@
 # Architecture
 
-Core design of SecurMCP: the decision pipeline, every component, failure behavior, hardening, observability, and how it's tested, built, and deployed. See [`README.md`](./README.md) for the pitch and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for what this design does and doesn't protect against.
+Core design of PortunusMCP: the decision pipeline, every component, failure behavior, hardening, observability, and how it's tested, built, and deployed. See [`README.md`](./README.md) for the pitch and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for what this design does and doesn't protect against.
 
 > Section numbers below start at 4 and internal cross-references (e.g. `§4.5`, `§5`) refer to headers within *this file* — the numbering is inherited from when this was one combined spec document and preserved here so nothing needed renumbering during the split.
 
@@ -15,7 +15,7 @@ The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the 
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client (Streamable HTTP)
-    participant Gateway as SecurMCP Gateway
+    participant Gateway as PortunusMCP Gateway
     participant Audit as Audit Log (Postgres)
     participant Server as Upstream MCP Server (stdio)
 
@@ -122,7 +122,7 @@ Every box inside the gateway subgraph is a module in `services/gateway/` with th
 graph TD
     Client["MCP Client"] -->|"Streamable HTTP"| Interceptor
 
-    subgraph Gateway["SecurMCP Gateway process"]
+    subgraph Gateway["PortunusMCP Gateway process"]
         Interceptor["JSON-RPC Interceptor + Session Manager"]
         Interceptor --> Replay["1 Replay Guard"]
         Replay --> Auth["2 Auth / Identity"]
@@ -169,7 +169,7 @@ graph TD
 
     subgraph Compose["Docker Compose, single host"]
         subgraph GWC["gateway container"]
-            G["SecurMCP Gateway (FastAPI)"]
+            G["PortunusMCP Gateway (FastAPI)"]
             U["stdio upstream subprocess, one per session"]
             G --> U
         end
@@ -355,7 +355,7 @@ The score maps to an action: **allow** (score < 40), **challenge** (40-70 — a 
 **Step-Up Auth Lifecycle (item 37)** — for an identity with a TOTP factor configured (`totp_secret_env` in the policy YAML — the same env-var indirection as `signing_secret_env`, available under either `auth_mode`), `CHALLENGE` is answerable rather than a deny wearing a friendlier name:
 
 - The CHALLENGE decision carries a one-time `challenge_id`. The pending challenge lives in **Redis with a short TTL** (default 5 minutes), pinning the identity, server, tool, and arguments hash — deliberately not a Postgres table like approvals: there is no human queue that must survive a restart, and a dropped challenge is just re-triggered by the next call.
-- A human reads a code off their authenticator app (RFC 6238 — 30s step, 6 digits, ±1 step of clock skew; the secret never travels) and the client retries with `securmcp/challenge_id` and `securmcp/challenge_proof` in `params._meta`.
+- A human reads a code off their authenticator app (RFC 6238 — 30s step, 6 digits, ±1 step of clock skew; the secret never travels) and the client retries with `portunusmcp/challenge_id` and `portunusmcp/challenge_proof` in `params._meta`.
 - Redemption **consumes the challenge atomically first** (one-time use holds whatever else fails), then re-checks identity/server/tool and recomputes the arguments hash — a mismatch is the same TOCTOU class as approvals — then verifies the code and dedups it per identity, so a captured code cannot answer a second challenge within its validity window. Any failure is the terminal `DENY_STEP_UP`.
 - **The retry is re-scored.** A verified proof only clears the CHALLENGE band: if the fresh score lands in the approval (70-90) or deny (>90) band, those still stand — step-up can never bypass human approval or `DENY_RISK`. (Approval redemption, by contrast, skips re-scoring: there a human reviewed the exact call; here the human only proved presence.)
 - Identities without a factor keep the terminal CHALLENGE, exactly as before item 37.
@@ -388,8 +388,8 @@ runs the same evaluation path *without* actually forwarding the call — useful 
 
 **Auth Layer (v1)**, fully specified — two per-identity postures, declared as `auth_mode` in the policy YAML (item 34):
 
-- **`bearer` (default)** — client presents an API key in a custom header (`X-SecurMCP-Key`). The key itself is a high-entropy secret (a 32-byte random value, base64-encoded, generated at identity-creation time via `scripts/generate_api_key.py` and shown to the operator exactly once); the policy store never holds the raw key, only `SHA256(key)`. On each request, the gateway hashes the presented key and looks up the resulting hash directly against the stored identity records — a hash-and-lookup, **not** an HMAC or signing scheme. Works with any stock MCP client; the tradeoff is that the credential rides every request, so a captured request is a stolen key.
-- **`signed`** — no secret on the wire at all. The policy holds a *non-secret* `key_id` and the *name* of an environment variable (`signing_secret_env`) the gateway resolves the shared secret from at policy load (fail-closed if unset; secrets never enter the policy file, its revision snapshots, logs, or audit rows). Every request and notification the client sends carries `securmcp/key-id` and `securmcp/signature` in `params._meta` alongside the nonce/timestamp, where the signature is HMAC-SHA256 over the canonicaljson of `{nonce, timestamp, method, tool, arguments}`. Verification happens at the HTTP edge, before the transport parses the message — any failure is a plain 401. GET (the SSE stream) and DELETE carry no body to sign; they are bound to the session that a signature-verified `initialize` created (residual: possession of a captured session id reads that session's response stream until teardown — see `THREAT_MODEL.md`). `signed` identities cannot be `admin: true` (rejected at load): the `/admin` API authenticates by bearer key only.
+- **`bearer` (default)** — client presents an API key in a custom header (`X-PortunusMCP-Key`). The key itself is a high-entropy secret (a 32-byte random value, base64-encoded, generated at identity-creation time via `scripts/generate_api_key.py` and shown to the operator exactly once); the policy store never holds the raw key, only `SHA256(key)`. On each request, the gateway hashes the presented key and looks up the resulting hash directly against the stored identity records — a hash-and-lookup, **not** an HMAC or signing scheme. Works with any stock MCP client; the tradeoff is that the credential rides every request, so a captured request is a stolen key.
+- **`signed`** — no secret on the wire at all. The policy holds a *non-secret* `key_id` and the *name* of an environment variable (`signing_secret_env`) the gateway resolves the shared secret from at policy load (fail-closed if unset; secrets never enter the policy file, its revision snapshots, logs, or audit rows). Every request and notification the client sends carries `portunusmcp/key-id` and `portunusmcp/signature` in `params._meta` alongside the nonce/timestamp, where the signature is HMAC-SHA256 over the canonicaljson of `{nonce, timestamp, method, tool, arguments}`. Verification happens at the HTTP edge, before the transport parses the message — any failure is a plain 401. GET (the SSE stream) and DELETE carry no body to sign; they are bound to the session that a signature-verified `initialize` created (residual: possession of a captured session id reads that session's response stream until teardown — see `THREAT_MODEL.md`). `signed` identities cannot be `admin: true` (rejected at load): the `/admin` API authenticates by bearer key only.
 
 A rolling Redis counter tracks failed lookups — wrong bearer keys, unknown key ids, bad signatures — feeding the Risk Engine's auth-failure signal above. No session cookies, no JWTs for v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item (this is where you'd map an upstream OAuth token per user identity so the gateway never holds a single shared credential).
 
@@ -510,10 +510,10 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 *Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
-- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `securmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type), `securmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `securmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `securmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `securmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `securmcp_replay_denied_total`.
+- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `portunusmcp_replay_denied_total`.
 - **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and docker-compose deliberately does not publish either port. Prometheus scrapes them over the compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
 - **Prometheus + Grafana containers:** opt-in via `docker compose --profile monitoring up -d` (config in `monitoring/`; Prometheus UI on 9090, Grafana on 3000 with anonymous access for local dev). The default compose stack is unchanged.
-- **Grafana dashboard** (`monitoring/grafana/dashboards/securmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
+- **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
 - **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Shipped in MVP regardless of the Prometheus/Grafana timeline.
 
 ---

@@ -97,7 +97,7 @@ async def _get_decision(gw: Gateway, seq: Any) -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{gw.url}/admin/decisions/{seq}",
-            headers={"X-SecurMCP-Key": gw.keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": gw.keys["ops-admin"]},
         )
     assert response.status_code == 200
     return response.json()
@@ -107,7 +107,7 @@ async def _explain(gw: Gateway, identity: str, arguments: dict[str, Any]) -> dic
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{gw.url}/admin/decisions/explain",
-            headers={"X-SecurMCP-Key": gw.keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": gw.keys["ops-admin"]},
             json={"identity": identity, "tool": "send_email", "arguments": arguments},
         )
     assert response.status_code == 200

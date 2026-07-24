@@ -99,13 +99,13 @@ async def test_risk_scoring_and_approval_lifecycle(risk_gateway: Gateway) -> Non
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{risk_gateway.url}/admin/approvals/{approval_id}/approve",
-                headers={"X-SecurMCP-Key": risk_gateway.keys["agent"]},
+                headers={"X-PortunusMCP-Key": risk_gateway.keys["agent"]},
             )
             assert response.status_code == 403
 
             response = await client.post(
                 f"{risk_gateway.url}/admin/approvals/{approval_id}/approve",
-                headers={"X-SecurMCP-Key": risk_gateway.keys["ops-admin"]},
+                headers={"X-PortunusMCP-Key": risk_gateway.keys["ops-admin"]},
             )
         assert response.status_code == 200
         assert response.json()["event_type"] == "APPROVED"
@@ -205,7 +205,7 @@ async def test_expired_approval_cannot_be_granted_or_redeemed(
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{risk_gateway.url}/admin/approvals/{approval_id}/approve",
-                headers={"X-SecurMCP-Key": risk_gateway.keys["ops-admin"]},
+                headers={"X-PortunusMCP-Key": risk_gateway.keys["ops-admin"]},
             )
         assert response.status_code == 404
         assert "expired" in response.json()["detail"]

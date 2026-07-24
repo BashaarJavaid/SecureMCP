@@ -62,7 +62,7 @@ class Identity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    # Auth posture (item 34). `bearer`: today's X-SecurMCP-Key header, looked up by
+    # Auth posture (item 34). `bearer`: today's X-PortunusMCP-Key header, looked up by
     # api_key_hash. `signed`: no key on the wire — the request carries a non-secret
     # key_id plus an HMAC in params._meta, verified with a secret resolved from the
     # environment at load time (never stored in the policy file or its revision

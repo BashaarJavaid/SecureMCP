@@ -487,7 +487,7 @@ class Interceptor:
     async def _refetch_tools(self) -> list[dict[str, Any]] | None:
         """Gateway-initiated tools/list (§8 TTL expiry / cache miss). The re-fetched
         schema goes through the same drift check as a client-initiated list."""
-        request_id = f"securmcp:{uuid.uuid4().hex}"
+        request_id = f"portunusmcp:{uuid.uuid4().hex}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._internal[request_id] = future
         try:

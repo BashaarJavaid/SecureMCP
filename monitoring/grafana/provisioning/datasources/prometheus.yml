@@ -3,7 +3,7 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
-    uid: securmcp-prometheus
+    uid: portunusmcp-prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true

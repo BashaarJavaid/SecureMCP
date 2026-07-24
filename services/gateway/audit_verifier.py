@@ -9,7 +9,7 @@ self-consistent but unsignable without the gateway's private key).
 On a break the checkpoint stops advancing at the last good row and never moves past
 it — everything downstream of a confirmed break is untrusted regardless of whether it
 individually re-verifies. Alerting is the structured error log plus the §7
-securmcp_audit_chain_verify_failures_total counter (item 25) — alert on any increase.
+portunusmcp_audit_chain_verify_failures_total counter (item 25) — alert on any increase.
 The daemon being down never blocks live traffic (§5): it is a detective control, not
 a preventive one.
 """

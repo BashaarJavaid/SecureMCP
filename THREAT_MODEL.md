@@ -1,6 +1,6 @@
 # Threat Model
 
-What SecurMCP protects against, what it explicitly does not, and the assumptions the whole model depends on. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for how each protection is implemented, and [`docs/adr/`](./docs/adr/) for why certain alternative approaches weren't used.
+What PortunusMCP protects against, what it explicitly does not, and the assumptions the whole model depends on. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for how each protection is implemented, and [`docs/adr/`](./docs/adr/) for why certain alternative approaches weren't used.
 
 ---
 
@@ -23,10 +23,10 @@ An explicit scope boundary is worth more to a technical reviewer than an implied
 
 - TLS terminates correctly at the load balancer/ingress; the gateway does not itself defend against a broken or misconfigured TLS termination point.
 - The gateway host is not already compromised at deployment time (a compromised host invalidates the signing-key and credential guarantees entirely — see the threat table above).
-- The upstream MCP server's *identity* (which server this is) is authenticated at the transport layer (e.g. mTLS or a pinned endpoint) — SecurMCP defends against a server's *behavior* changing (drift), not against connecting to an impersonated server in the first place.
+- The upstream MCP server's *identity* (which server this is) is authenticated at the transport layer (e.g. mTLS or a pinned endpoint) — PortunusMCP defends against a server's *behavior* changing (drift), not against connecting to an impersonated server in the first place.
 - Redis is a trusted component within the deployment's network boundary — it is not itself hardened against a malicious actor with direct network access to it.
-- Postgres is trusted to execute the queries it's given faithfully — SecurMCP defends against *external* tampering with stored rows (via the hash chain and signatures), not against a malicious database engine or a superuser with direct `UPDATE` access bypassing the application entirely (covered under "insider admin," above).
-- The `mcp` SDK's own JSON-RPC framing is trusted to be spec-compliant; SecurMCP does not re-implement wire-level protocol conformance checking beyond what it needs for interception.
+- Postgres is trusted to execute the queries it's given faithfully — PortunusMCP defends against *external* tampering with stored rows (via the hash chain and signatures), not against a malicious database engine or a superuser with direct `UPDATE` access bypassing the application entirely (covered under "insider admin," above).
+- The `mcp` SDK's own JSON-RPC framing is trusted to be spec-compliant; PortunusMCP does not re-implement wire-level protocol conformance checking beyond what it needs for interception.
 - **Multiple upstreams are registered per policy (`servers:` block, item 35).** Each entry is a `server_id → stdio command`; clients connect to `/mcp/<server_id>` and one session is bound to one upstream at connect time. RBAC grants, drift baselines, schema caches, risk frequency/decay counters, and approvals are all keyed on the real `server_id` — an identically-named tool on two servers is two different tools (`tests/integration/test_multi_server.py`). Registration is still the trust decision: every registered server gets the same pipeline and thresholds; per-server trust tiers remain a discussion (`ARCHITECTURE.md` §4.7), not a capability.
 
 ---

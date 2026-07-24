@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Defaults are local-dev only; docker-compose.yml / .env override them.
-    database_url: str = "postgresql+asyncpg://securmcp:securmcp@localhost:5432/securmcp"
+    database_url: str = "postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp"
     redis_url: str = "redis://localhost:6379/0"
     policy_file: str = "policies/example-policy.yaml"
     # Append-only revision snapshots written on every policy activation (§4.8, item 19).

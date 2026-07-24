@@ -1,4 +1,4 @@
-"""Mint credentials for a SecurMCP identity (ARCHITECTURE.md §4.8).
+"""Mint credentials for a PortunusMCP identity (ARCHITECTURE.md §4.8).
 
 Default (bearer): prints the raw key exactly once — hand it to the operator, it is
 never stored. Paste the api_key_hash line into the identity's entry in the policy YAML.
@@ -19,7 +19,7 @@ import sys
 
 if "--totp" in sys.argv[1:]:
     secret = base64.b32encode(secrets.token_bytes(20)).decode()
-    env_name = f"SECURMCP_TOTP_SECRET_{secrets.token_hex(4).upper()}"
+    env_name = f"PORTUNUSMCP_TOTP_SECRET_{secrets.token_hex(4).upper()}"
     print(f"TOTP secret (shown once; load into an authenticator app): {secret}")
     print("\nExport it on the gateway host (rename the var to taste):")
     print(f"  export {env_name}={secret}")
@@ -28,7 +28,7 @@ if "--totp" in sys.argv[1:]:
 elif "--signed" in sys.argv[1:]:
     key_id = f"kid_{secrets.token_hex(8)}"
     secret = base64.b64encode(secrets.token_bytes(32)).decode()
-    env_name = f"SECURMCP_SIGNING_SECRET_{secrets.token_hex(4).upper()}"
+    env_name = f"PORTUNUSMCP_SIGNING_SECRET_{secrets.token_hex(4).upper()}"
     print(f"Signing secret (shown once, store securely): {secret}")
     print("\nExport it on the gateway host (rename the var to taste):")
     print(f"  export {env_name}={secret}")

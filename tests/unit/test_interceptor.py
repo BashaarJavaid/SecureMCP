@@ -371,7 +371,7 @@ async def test_cache_miss_triggers_transparent_refetch_then_forwards() -> None:
     while not sent:  # wait for the gateway's own tools/list to go out
         await asyncio.sleep(0.01)
     internal_id = sent[0].root.id
-    assert str(internal_id).startswith("securmcp:")
+    assert str(internal_id).startswith("portunusmcp:")
 
     swallowed = await interceptor.on_upstream_message(
         SessionMessage(
@@ -480,7 +480,7 @@ async def test_malformed_nonce_is_denied_before_rbac() -> None:
 
 
 async def test_bearer_call_without_nonce_skips_replay_and_forwards() -> None:
-    # Item 34: a stock MCP client sends no securmcp _meta at all — bearer identities
+    # Item 34: a stock MCP client sends no portunusmcp _meta at all — bearer identities
     # skip stage 1 entirely and the rest of the pipeline still runs.
     interceptor, writer, _, _ = make_interceptor()
     outcome = await interceptor.on_client_message(
@@ -825,7 +825,7 @@ async def test_risk_runs_before_param_validation() -> None:
 
 
 async def test_approved_retry_redeems_and_skips_risk_scoring() -> None:
-    """A valid securmcp/approval_id bypasses stage 6 (a human approved this exact
+    """A valid portunusmcp/approval_id bypasses stage 6 (a human approved this exact
     call) but not param validation; the approval meta key never leaks upstream."""
     interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(91))  # would deny if scored
     outcome = await interceptor.on_client_message(

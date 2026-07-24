@@ -104,7 +104,7 @@ async def _simulate(gw: Gateway, body: dict, key_id: str = "ops-admin") -> httpx
     async with httpx.AsyncClient() as client:
         return await client.post(
             f"{gw.url}/admin/policy/simulate",
-            headers={"X-SecurMCP-Key": gw.keys[key_id]},
+            headers={"X-PortunusMCP-Key": gw.keys[key_id]},
             json=body,
         )
 

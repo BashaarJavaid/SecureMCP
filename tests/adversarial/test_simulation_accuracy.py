@@ -92,7 +92,7 @@ async def test_replay_evaluates_the_historical_hour(hour_gateway: Gateway) -> No
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{gw.url}/admin/policy/simulate",
-            headers={"X-SecurMCP-Key": gw.keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": gw.keys["ops-admin"]},
             json={"candidate_version": 2, "replay_window": _window()},
         )
     assert response.status_code == 200

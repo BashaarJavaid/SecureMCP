@@ -1,1 +1,1 @@
-"""SecurMCP services."""
+"""PortunusMCP services."""

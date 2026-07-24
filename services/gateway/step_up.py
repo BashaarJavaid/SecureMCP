@@ -6,7 +6,7 @@ terminal error — provided the identity has a TOTP factor configured
 at load, same indirection as item 34's signing secret). The client surfaces the
 challenge to a human, who reads a code off their authenticator app; the retry
 carries the challenge id and code in `params._meta`, structurally the same
-one-time redeem-token pattern as `securmcp/approval_id`.
+one-time redeem-token pattern as `portunusmcp/approval_id`.
 
 Pending challenges live in Redis with a short TTL, consumed atomically via GETDEL —
 one-time use, no migration, and a gateway restart simply drops them (the client
@@ -32,8 +32,8 @@ import redis.asyncio as aioredis
 
 from services.gateway.config import settings
 
-CHALLENGE_ID_META_KEY = "securmcp/challenge_id"
-CHALLENGE_PROOF_META_KEY = "securmcp/challenge_proof"
+CHALLENGE_ID_META_KEY = "portunusmcp/challenge_id"
+CHALLENGE_PROOF_META_KEY = "portunusmcp/challenge_proof"
 
 # RFC 6238 spec constants, not knobs (item-32 precedent): 30s step, 6 digits,
 # SHA-1 (what authenticator apps implement), ±1 step of clock skew.

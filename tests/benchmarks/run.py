@@ -96,7 +96,7 @@ async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSes
     """The integration suite's connect(), but with a long timeout: 100 concurrent
     initializes each spawn an upstream subprocess and blow past httpx's 5s default."""
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Key": gw.keys[identity]},
+        headers={"X-PortunusMCP-Key": gw.keys[identity]},
         follow_redirects=True,
         timeout=httpx.Timeout(300.0),
     ) as http_client:
@@ -228,7 +228,7 @@ def render(report: dict) -> str:
     single, conc, payload = report["single_call"], report["concurrent"], report["payload_size"]
     overhead = {k: single["gateway_cached"][k] - single["direct"][k] for k in single["direct"]}
     lines = [
-        "# SecurMCP benchmark report",
+        "# PortunusMCP benchmark report",
         "",
         f"- commit: {report['commit']}  |  date: {report['date']}",
         f"- host: {report['host']}  |  python: {report['python']}",

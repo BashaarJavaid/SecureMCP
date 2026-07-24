@@ -29,7 +29,7 @@ from services.gateway.step_up import (
 from tests.integration.conftest import ECHO_SERVER, _key_hash, running_gateway
 from tests.integration.test_policy_scoping import connect
 
-TOTP_SECRET_ENV = "SECURMCP_TEST_TOTP_SECRET"
+TOTP_SECRET_ENV = "PORTUNUSMCP_TEST_TOTP_SECRET"
 
 
 @dataclass

@@ -1,8 +1,8 @@
-# SecurMCP
+# PortunusMCP
 
 **A policy-enforcing gateway proxy for the Model Context Protocol (MCP)** — identity-scoped tool visibility, schema-drift ("rug pull") detection, per-call risk scoring, and a tamper-evident signed audit trail, with no changes required to the upstream MCP server.
 
-[![ci](https://github.com/BashaarJavaid/SecureMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/BashaarJavaid/SecureMCP/actions/workflows/ci.yml)
+[![ci](https://github.com/BashaarJavaid/PortunusMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/BashaarJavaid/PortunusMCP/actions/workflows/ci.yml)
 ![coverage](https://img.shields.io/badge/coverage-%E2%89%A580%25%20(CI--gated)-brightgreen)
 ![python](https://img.shields.io/badge/python-3.12-blue)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -21,7 +21,7 @@ MCP defines a JSON-RPC 2.0 transport between LLM clients and tool servers, but d
 2. **Rug pulls.** A server can change a tool's schema *after* a human approved it in a prior session, with nothing to detect the drift.
 3. **No audit trail.** Nothing records which identity invoked which tool with which arguments, under which policy, in a form you could later prove wasn't edited.
 
-SecurMCP sits between the two and closes those three.
+PortunusMCP sits between the two and closes those three.
 
 ### Client compatibility
 
@@ -37,7 +37,7 @@ Every box inside the gateway is a module in `services/gateway/` with the same na
 graph TD
     Client["MCP Client"] -->|"Streamable HTTP"| Interceptor
 
-    subgraph Gateway["SecurMCP Gateway process"]
+    subgraph Gateway["PortunusMCP Gateway process"]
         Interceptor["JSON-RPC Interceptor + Session Manager"]
         Interceptor --> Replay["1 Replay Guard"]
         Replay --> Auth["2 Auth / Identity"]
@@ -110,7 +110,7 @@ POLICY_FILE=policies/demo-policy.yaml \
 curl -X POST localhost:9800/_admin/apply_mutation
 
 # when it prompts again — hot-load the tightened v2 policy for the simulation finale:
-docker kill -s HUP securemcp-gateway-1
+docker kill -s HUP portunusmcp-gateway-1
 ```
 
 The driver connects as `developer` — a stock MCP client, no custom `_meta` anywhere (sees only `send_email` / `read_inbox`; the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call succeeding against the new schema, then the `signed` ci-agent's captured request replayed byte-identically (`DENY_REPLAY`) and with a forged fresh nonce (HTTP 401 — the capture holds no credential to re-sign with), and finally a Policy Simulation replaying the demo's own traffic against the v2 draft (`would_now_deny: 3`) before printing the hash-chained audit receipts.

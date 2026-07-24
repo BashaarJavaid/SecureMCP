@@ -77,7 +77,7 @@ async def test_get_decision_reconstructs_live_terminals(explain_gateway: Gateway
         challenge = excinfo.value.error.data
 
     async with httpx.AsyncClient() as client:
-        admin = {"X-SecurMCP-Key": explain_gateway.keys["ops-admin"]}
+        admin = {"X-PortunusMCP-Key": explain_gateway.keys["ops-admin"]}
         response = await client.get(
             f"{explain_gateway.url}/admin/decisions/{rbac_deny['audit_id']}", headers=admin
         )
@@ -116,7 +116,7 @@ async def test_explain_matches_live_outcome_without_side_effects(
             assert await redis_client.get(freq_key) is None
 
             async with httpx.AsyncClient() as client:
-                admin = {"X-SecurMCP-Key": explain_gateway.keys["ops-admin"]}
+                admin = {"X-PortunusMCP-Key": explain_gateway.keys["ops-admin"]}
                 url = f"{explain_gateway.url}/admin/decisions/explain"
                 response = await client.post(
                     url,
@@ -159,8 +159,8 @@ async def test_explain_matches_live_outcome_without_side_effects(
 async def test_admin_auth_and_missing_rows(explain_gateway: Gateway) -> None:
     async with httpx.AsyncClient() as client:
         url = f"{explain_gateway.url}/admin/decisions"
-        agent = {"X-SecurMCP-Key": explain_gateway.keys["agent"]}
-        admin = {"X-SecurMCP-Key": explain_gateway.keys["ops-admin"]}
+        agent = {"X-PortunusMCP-Key": explain_gateway.keys["agent"]}
+        admin = {"X-PortunusMCP-Key": explain_gateway.keys["ops-admin"]}
 
         assert (await client.get(f"{url}/1", headers=agent)).status_code == 403
         assert (await client.get(f"{url}/1")).status_code == 401

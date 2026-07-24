@@ -18,13 +18,13 @@ Run (mint the audit signing keypair once first — the gateway won't start witho
 and when prompted, in another terminal (the exact command, with this run's secret,
 is printed by the script):
     POLICY_FILE=policies/demo-policy.yaml \
-      SECURMCP_DEMO_SIGNING_SECRET=<printed by the script> \
+      PORTUNUSMCP_DEMO_SIGNING_SECRET=<printed by the script> \
       docker compose up -d --build
 (the rogue upstream command lives in the demo policy's `servers:` block, item 35)
 then, when prompted again (the rug pull, visible on screen):
     curl -X POST localhost:9800/_admin/apply_mutation
 and for the closing simulation beat (activates the v2 draft so it gets a snapshot):
-    docker kill -s HUP securemcp-gateway-1
+    docker kill -s HUP portunusmcp-gateway-1
 """
 
 import asyncio
@@ -82,7 +82,7 @@ def mint_key() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
-SIGNED_SECRET_ENV_NAME = "SECURMCP_DEMO_SIGNING_SECRET"
+SIGNED_SECRET_ENV_NAME = "PORTUNUSMCP_DEMO_SIGNING_SECRET"
 SIGNED_HEADERS = {
     "content-type": "application/json",
     "accept": "application/json, text/event-stream",
@@ -205,7 +205,7 @@ async def reset_dev_state() -> None:
 @asynccontextmanager
 async def connect(api_key: str) -> AsyncIterator[ClientSession]:
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
+        headers={"X-PortunusMCP-Key": api_key}, follow_redirects=True
     ) as http_client:
         async with streamable_http_client(f"{GATEWAY}/mcp/default", http_client=http_client) as (
             read,
@@ -226,13 +226,13 @@ async def wait_for_gateway(api_key: str, signing_secret: str) -> None:
     print("  (the rogue upstream command is in the demo policy's servers: block)")
     print(
         "  (stack already running with the demo policy? hot-reload this run's fresh"
-        " keys with:  docker kill -s HUP securemcp-gateway-1)"
+        " keys with:  docker kill -s HUP portunusmcp-gateway-1)"
     )
     async with httpx.AsyncClient() as client:
         for _ in range(240):
             try:
                 response = await client.post(
-                    f"{GATEWAY}/mcp/default", json={}, headers={"X-SecurMCP-Key": api_key}
+                    f"{GATEWAY}/mcp/default", json={}, headers={"X-PortunusMCP-Key": api_key}
                 )
                 if response.status_code != 401:  # demo key accepted => demo policy live
                     print("  gateway is up.")
@@ -285,7 +285,7 @@ async def approve_and_retry(keys: dict[str, str]) -> None:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{GATEWAY}/admin/tools/default/send_email/approve",
-            headers={"X-SecurMCP-Key": keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": keys["ops-admin"]},
         )
         response.raise_for_status()
         decision = response.json()
@@ -375,14 +375,14 @@ async def simulate_draft_policy(keys: dict[str, str], ci_key_id: str) -> None:
     section("policy simulation — preview a tightened v2 policy against today's traffic")
     write_policy(keys, ci_key_id, version=2, developer_tools=["read_inbox"])
     print("  v2 draft written to policies/demo-policy.yaml: developer LOSES send_email.")
-    print("  In another terminal:  docker kill -s HUP securemcp-gateway-1")
+    print("  In another terminal:  docker kill -s HUP portunusmcp-gateway-1")
     print("  (hot-reloads v2 and records the revision snapshot the simulator needs)")
     today = time.strftime("%Y-%m-%d", time.gmtime())
     async with httpx.AsyncClient() as client:
         for _ in range(240):
             response = await client.post(
                 f"{GATEWAY}/admin/policy/simulate",
-                headers={"X-SecurMCP-Key": keys["ops-admin"]},
+                headers={"X-PortunusMCP-Key": keys["ops-admin"]},
                 json={"candidate_version": 2, "replay_window": f"{today}..{today}"},
             )
             if response.status_code == 200:
@@ -435,7 +435,7 @@ async def show_audit_receipts() -> None:
 
 
 async def main() -> None:
-    section("SecurMCP demo — pruning, drift blocking, replay guard, policy simulation")
+    section("PortunusMCP demo — pruning, drift blocking, replay guard, policy simulation")
     STATE_PATH.unlink(missing_ok=True)  # start from the benign schema
     await reset_dev_state()
     keys = {"developer": mint_key(), "ops-admin": mint_key()}

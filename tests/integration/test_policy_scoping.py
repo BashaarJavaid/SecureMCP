@@ -17,7 +17,7 @@ from tests.integration.conftest import Gateway
 async def connect(url: str, api_key: str) -> AsyncIterator[ClientSession]:
     # follow_redirects matches the SDK's default client (Mount("/mcp") redirects to /mcp/).
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Key": api_key}, follow_redirects=True
+        headers={"X-PortunusMCP-Key": api_key}, follow_redirects=True
     ) as http_client:
         async with streamable_http_client(f"{url}/mcp/default", http_client=http_client) as (
             read,
@@ -62,14 +62,14 @@ async def test_missing_key_is_401(gateway: Gateway) -> None:
 
 
 async def test_wrong_key_is_401(gateway: Gateway) -> None:
-    async with httpx.AsyncClient(headers={"X-SecurMCP-Key": "not-a-real-key"}) as client:
+    async with httpx.AsyncClient(headers={"X-PortunusMCP-Key": "not-a-real-key"}) as client:
         response = await client.post(f"{gateway.url}/mcp/", json={})
         assert response.status_code == 401
 
 
 async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway) -> None:
     async with httpx.AsyncClient(
-        headers={"X-SecurMCP-Key": gateway.keys["agent-readonly"]}, follow_redirects=True
+        headers={"X-PortunusMCP-Key": gateway.keys["agent-readonly"]}, follow_redirects=True
     ) as http_client:
         async with streamable_http_client(
             f"{gateway.url}/mcp/default", http_client=http_client
@@ -88,7 +88,7 @@ async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway)
                     response = await other.get(
                         f"{gateway.url}/mcp/default",
                         headers={
-                            "X-SecurMCP-Key": gateway.keys["agent-full"],
+                            "X-PortunusMCP-Key": gateway.keys["agent-full"],
                             "mcp-session-id": session_id,
                         },
                     )

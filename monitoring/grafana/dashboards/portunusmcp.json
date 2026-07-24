@@ -1,6 +1,6 @@
 {
-  "uid": "securmcp",
-  "title": "SecurMCP Gateway",
+  "uid": "portunusmcp",
+  "title": "PortunusMCP Gateway",
   "timezone": "utc",
   "refresh": "30s",
   "time": { "from": "now-1h", "to": "now" },
@@ -10,11 +10,11 @@
       "type": "timeseries",
       "title": "Allow / deny / challenge rate",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "securmcp-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "portunusmcp-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (decision) (rate(securmcp_tool_calls_total[$__rate_interval]))",
+          "expr": "sum by (decision) (rate(portunusmcp_tool_calls_total[$__rate_interval]))",
           "legendFormat": "{{decision}}"
         }
       ],
@@ -25,11 +25,11 @@
       "type": "bargauge",
       "title": "Top denied tools",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "securmcp-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "portunusmcp-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (tool) (increase(securmcp_tool_calls_total{decision=~\"DENY_.*\"}[$__range])))",
+          "expr": "topk(10, sum by (tool) (increase(portunusmcp_tool_calls_total{decision=~\"DENY_.*\"}[$__range])))",
           "legendFormat": "{{tool}}",
           "instant": true
         }
@@ -42,11 +42,11 @@
       "type": "timeseries",
       "title": "Schema drift events by severity",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "securmcp-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "portunusmcp-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (severity) (increase(securmcp_schema_drift_total[$__rate_interval]))",
+          "expr": "sum by (severity) (increase(portunusmcp_schema_drift_total[$__rate_interval]))",
           "legendFormat": "{{severity}}"
         }
       ],
@@ -60,11 +60,11 @@
       "type": "heatmap",
       "title": "Risk score distribution",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "securmcp-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "portunusmcp-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (le) (increase(securmcp_risk_score_bucket[$__rate_interval]))",
+          "expr": "sum by (le) (increase(portunusmcp_risk_score_bucket[$__rate_interval]))",
           "format": "heatmap",
           "legendFormat": "{{le}}"
         }
@@ -75,21 +75,21 @@
       "type": "timeseries",
       "title": "Pipeline decision latency (proxy overhead, excludes upstream)",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "securmcp-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "portunusmcp-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(securmcp_request_latency_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(portunusmcp_request_latency_seconds_bucket[$__rate_interval])))",
           "legendFormat": "p50"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(securmcp_request_latency_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(portunusmcp_request_latency_seconds_bucket[$__rate_interval])))",
           "legendFormat": "p95"
         },
         {
           "refId": "C",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(securmcp_request_latency_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(portunusmcp_request_latency_seconds_bucket[$__rate_interval])))",
           "legendFormat": "p99"
         }
       ],

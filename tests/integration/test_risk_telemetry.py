@@ -105,7 +105,7 @@ async def test_auth_failure_spike_raises_every_identitys_calls(
         for _ in range(6):
             response = await client.post(
                 f"{telemetry_gateway.url}/mcp/",
-                headers={"X-SecurMCP-Key": "not-a-real-key"},
+                headers={"X-PortunusMCP-Key": "not-a-real-key"},
                 json={},
             )
             assert response.status_code == 401
@@ -144,7 +144,7 @@ async def test_drift_history_survives_reapproval(drift_history_gateway: Gateway)
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{gw.url}/admin/tools/default/send_email/approve",
-            headers={"X-SecurMCP-Key": gw.keys["ops-admin"]},
+            headers={"X-PortunusMCP-Key": gw.keys["ops-admin"]},
         )
         assert response.status_code == 200
 

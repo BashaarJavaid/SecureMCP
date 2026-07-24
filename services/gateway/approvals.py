@@ -3,7 +3,7 @@
 A HUMAN_APPROVAL_REQUIRED decision creates a Postgres `approvals` row tied to that
 decision's audit seq (restart-durable: pending state survives the gateway). An admin
 approves via POST /admin/approvals/{approval_id}/approve; the client then *re-invokes*
-the tool with the approval id in `params._meta` under `securmcp/approval_id` (the held
+the tool with the approval id in `params._meta` under `portunusmcp/approval_id` (the held
 call is not auto-retried), alongside a fresh replay nonce/timestamp.
 
 Redemption re-checks everything the approval asserted: identity and tool must match,
@@ -26,7 +26,7 @@ from services.gateway.config import settings
 from services.gateway.db import Approval
 from services.gateway.decision import EventType
 
-APPROVAL_META_KEY = "securmcp/approval_id"
+APPROVAL_META_KEY = "portunusmcp/approval_id"
 
 
 def arguments_hash(arguments: dict[str, Any]) -> str:

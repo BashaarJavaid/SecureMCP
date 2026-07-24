@@ -33,8 +33,8 @@ logger = structlog.get_logger(__name__)
 
 AUTH_FAILURE_KEY = "risk:auth_failures"
 
-KEY_ID_META_KEY = "securmcp/key-id"
-SIGNATURE_META_KEY = "securmcp/signature"
+KEY_ID_META_KEY = "portunusmcp/key-id"
+SIGNATURE_META_KEY = "portunusmcp/signature"
 
 
 def resolve_identity(api_key: str | None, engine: PolicyEngine) -> str | None:

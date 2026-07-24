@@ -2,7 +2,7 @@
 
 ## Status
 
-SecurMCP is pre-1.0 and maintained by a single author. It has not been through an
+PortunusMCP is pre-1.0 and maintained by a single author. It has not been through an
 external security audit. Treat it as a reference implementation and a starting point,
 not as a hardened product you drop in front of production traffic without reading it
 first.
@@ -11,7 +11,7 @@ first.
 
 **Do not open a public issue for a security bug.**
 
-Use GitHub's [private vulnerability reporting](https://github.com/BashaarJavaid/SecureMCP/security/advisories/new),
+Use GitHub's [private vulnerability reporting](https://github.com/BashaarJavaid/PortunusMCP/security/advisories/new),
 or email **aarish@issm.ai**.
 
 Please include the affected component, what an attacker gains, and a reproduction if

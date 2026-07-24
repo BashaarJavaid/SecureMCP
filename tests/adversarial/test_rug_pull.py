@@ -121,14 +121,14 @@ async def test_approve_flow_unblocks(drift_gateway: Gateway) -> None:
         async with httpx.AsyncClient() as client:
             # Non-admin identity: 403. Bad key: 401.
             response = await client.post(
-                approve_url, headers={"X-SecurMCP-Key": drift_gateway.keys["dev"]}
+                approve_url, headers={"X-PortunusMCP-Key": drift_gateway.keys["dev"]}
             )
             assert response.status_code == 403
-            response = await client.post(approve_url, headers={"X-SecurMCP-Key": "nope"})
+            response = await client.post(approve_url, headers={"X-PortunusMCP-Key": "nope"})
             assert response.status_code == 401
 
             response = await client.post(
-                approve_url, headers={"X-SecurMCP-Key": drift_gateway.keys["admin"]}
+                approve_url, headers={"X-PortunusMCP-Key": drift_gateway.keys["admin"]}
             )
             assert response.status_code == 200
             decision = response.json()
